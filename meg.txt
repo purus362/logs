@@ -1,0 +1,109 @@
+MERGE INTO CONNECT_CUSTOMER_TRANS CT
+        USING (
+          SELECT ORDER_NUMBER,
+              CLIENT_ID,
+              CLIENT_NAME,
+              ORDER_TYPE,
+              EXP_DELIVERY_DATE,--TO BE CHANGED
+              GENERATED_FROM,
+              TITLE,
+              CUSTOMER_SURNAME,
+              CUSTOMER_FIRST_NAME,
+              CUSTOMER_POSTCODE,
+              CUSTOMER_ADDRESS1,
+              CUSTOMER_ADDRESS2,
+              EMAIL_ADDRESS,
+              TELEPHONE_NUMBER,
+              CITY,
+              COUNTRY,
+              CARD_NUMBER,
+              DB_CREATED_DATE
+          FROM
+            (SELECT /*+ INDEX ( T IDX_TMP_PREADVICE_XML )  INDEX ( CPS IDX_STT_PRCL_NMB_PK )  INDEX ( CPST IDX_CON_PRCL_SRVC_TRNS ) */
+					NVL(T.EXTERNAL_ORDER_NUMBER,T.CONSIGNMENT_ID) "ORDER_NUMBER", --Changed on 12-Mar-2015 for Return --T.TRANSACTION_ID Changed on 26-May-2015
+                    T.PARCEL_TYPE "ORDER_TYPE",
+                    T.EXP_DELIVERY_DATE "EXP_DELIVERY_DATE",
+                    'Pre-Advice' "GENERATED_FROM",
+                    T.TITLE "TITLE",
+                    -- T.CUSTOMER_ID "CUSTOMER_ID",
+                    T.CLIENT_ID "CLIENT_ID",
+                    T.CLIENT_NAME "CLIENT_NAME",
+                    T.LAST_NAME "CUSTOMER_SURNAME",
+                    T.FIRST_NAME "CUSTOMER_FIRST_NAME",
+                    T.POSTAL_CODE "CUSTOMER_POSTCODE",
+                    T.ADDRESS_LINE_1 "CUSTOMER_ADDRESS1",
+                    T.ADDRESS_LINE_2 "CUSTOMER_ADDRESS2",
+                    T.EMAIL_ADDRESS  "EMAIL_ADDRESS",
+                    T.TELEPHONE_NUMBER "TELEPHONE_NUMBER",
+                    T.CITY "CITY",
+                    T.COUNTRY "COUNTRY",
+                    DECODE(CPST.SERVICE_TYPE,'CardCheck',CPST.SERVICE_NAME,NULL) "CARD_NUMBER",
+                    --T.CARD_NUMBER,
+                    SYSDATE "DB_CREATED_DATE",
+                    ROW_NUMBER () OVER (PARTITION BY ORDER_NUMBER,T.CLIENT_ID ORDER BY DECODE(CPST.SERVICE_TYPE,'CardCheck',CPST.SERVICE_NAME,NULL) NULLS LAST ) RN
+            FROM TMP_PREADVICE_XML T, CONNECT_PARCEL_STATE CPS, CONNECT_PARCEL_SERVICE_TRANS CPST
+            WHERE T.CONSIGNMENT_ID = CPS.PARCEL_NUMBER
+            AND CPS.PARCEL_NUMBER = CPST.PARCEL_NUMBER(+)
+            AND T.TRANSACTION_ID=TRANS_ID   ---COMBO RUN FIX (KD)
+            )
+          WHERE RN =1      ) B
+          ON (CT.ORDER_NUMBER = B.ORDER_NUMBER AND CT.CLIENT_ID = B.CLIENT_ID)
+          WHEN MATCHED THEN
+              UPDATE /*+ PARALLEL(16) */
+                  SET   CLIENT_NAME       = B.CLIENT_NAME,
+                  ORDER_TYPE        = B.ORDER_TYPE,
+                  ORDER_CREATED_DATE = B.EXP_DELIVERY_DATE,
+                  GENERATED_FROM    = B.GENERATED_FROM,
+                  TITLE             = B.TITLE,
+                  CUSTOMER_SURNAME   = B.CUSTOMER_SURNAME,
+                  CUSTOMER_FIRST_NAME = B.CUSTOMER_FIRST_NAME,
+                  CUSTOMER_POSTCODE = B.CUSTOMER_POSTCODE,
+                  CUSTOMER_ADDRESS1 = B.CUSTOMER_ADDRESS1,
+                  CUSTOMER_ADDRESS2 = B.CUSTOMER_ADDRESS2,
+                  CUSTOMER_EMAILID     = B.EMAIL_ADDRESS,
+                  CONTACT_NUMBER  = B.TELEPHONE_NUMBER,
+                  CITY              = B.CITY,
+                  COUNTRY           =  B.COUNTRY,
+                  CUSTOMER_CARD       = B.CARD_NUMBER,
+                  DB_CREATED_DATE   = B.DB_CREATED_DATE
+          WHEN NOT MATCHED THEN
+              INSERT /*+ PARALLEL(16) */
+			    ( ORDER_NUMBER,
+                  CLIENT_ID,
+                  CLIENT_NAME,
+                  ORDER_TYPE,
+                  ORDER_CREATED_DATE,
+                  GENERATED_FROM,
+                  TITLE,
+                  CUSTOMER_SURNAME,
+                  CUSTOMER_FIRST_NAME,
+                  CUSTOMER_POSTCODE,
+                  CUSTOMER_ADDRESS1,
+                  CUSTOMER_ADDRESS2,
+                  CUSTOMER_EMAILID,
+                  CONTACT_NUMBER,
+                  CITY,
+                  COUNTRY,
+                  CUSTOMER_CARD,
+                  DB_CREATED_DATE)
+             VALUES
+                  (
+                  B.ORDER_NUMBER,
+                  B.CLIENT_ID,
+                  B.CLIENT_NAME,
+                  B.ORDER_TYPE,
+                  B.EXP_DELIVERY_DATE,
+                  B.GENERATED_FROM,
+                  B.TITLE,
+                  B.CUSTOMER_SURNAME,
+                  B.CUSTOMER_FIRST_NAME,
+                  B.CUSTOMER_POSTCODE,
+                  B.CUSTOMER_ADDRESS1,
+                  B.CUSTOMER_ADDRESS2,
+                  B.EMAIL_ADDRESS,
+                  B.TELEPHONE_NUMBER,
+                  B.CITY,
+                  B.COUNTRY,
+                  B.CARD_NUMBER,
+                  B.DB_CREATED_DATE
+              );

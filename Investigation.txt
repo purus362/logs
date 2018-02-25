@@ -1,0 +1,1536 @@
+create or replace PACKAGE BODY PKG_PARCEL_COLLECTION
+IS
+--29-MAY-2015
+PROCEDURE PR_UPDATE_DWELL_TIME
+(
+ORDER_NUMBER_IN  VARCHAR2,
+CLIENT_ID_IN     VARCHAR2,
+ORIGIN_ID_IN     VARCHAR2,
+USER_ID_IN       VARCHAR2,
+DWELL_DETAILS      OBJ_DWELL_IN_TABLE,
+DWELL_RESPONSE_S OUT OBJ_DWELL_STATUS_SUCCESS_TBL,
+DWELL_RESPONSE_F OUT OBJ_DWELL_STATUS_FAILURE_TBL,
+V_DB_RESPONSE  OUT VARCHAR2,
+V_ERR_CODE OUT VARCHAR2
+)
+
+/***************************************************************
+*`
+* Program Name              :   PR_UPDATE_DWELL_TIME.sql
+* Author                    :   TCS
+* Creation Date             :   22-12-2014
+* Description               :   This scripts updates the dwell time for those parcel which
+                                are 'Ready for Collection'
+*
+* Calling program           :   APP LAYER
+*
+* Called program            :   PR_UPDATE_DWELL_TIME.sql
+*
+*
+* Input parameters          :   ORDER_NUMBER_IN,CLIENT_ID_IN,ORIGIN_ID_IN,USER_ID_IN,DWELL_DETAILS
+*
+* Output parameters         :   DWELL_RESPONSE_S,V_DB_RESPONSE
+*
+* Modifications : a history of changes to the program
+* <DD-MM-YYYY>   <Modifier Name>    <Description>  						<Version Id>
+* 09-11-2015      TCS                 CR 113          						1.1
+* 07-12-2015      TCS                 For email ID Size    					1.2
+* 25-04-2016      TCS                Fixing collection start time capture   1.3
+* 23-05-2016      TCS                Fixing ambiguoud columns  				2.0
+* 07-06-2016      TCS                Change Collect duration		    	2.1
+* 10-06-2016      TCS                Change Collect duration		    	2.2
+**************************************************************/
+
+IS
+
+V_PARCEL_NUMBER CONNECT_PARCEL_STATE.PARCEL_NUMBER%TYPE;
+
+
+V_VAR1           VARCHAR2(200);
+V_VAR2           VARCHAR2(200);
+V_FLAG           VARCHAR2(30);
+V_VAR4           NUMBER;
+V_DWELL_DATE     DATE;
+V_STATUS         NUMBER;
+EXP_BUSINNES_LGC EXCEPTION;
+V_CODE          VARCHAR2(50);
+V_COUNT         NUMBER;
+V_FLAG1         VARCHAR2(50);
+V_COUNT2        NUMBER;
+V_CODE2          VARCHAR2(50);
+V_FLAG2          VARCHAR2(30):='Found';
+
+
+V_QUOTE1 VARCHAR2(100):='Ready for Collection';
+V_QUOTE2 VARCHAR2(100):='Dwell time extended for Ready to collect parcels ';
+V_QUOTE3 VARCHAR2(100);
+V_QUOTE4 VARCHAR2(100);
+V_QUOTE5 VARCHAR2(100);
+
+V_QUOTE6 VARCHAR2(100):='Store DB Internal Error';--'Internal Failure' Commented on 07-May-2015
+V_QUOTE7 VARCHAR2(100):='Dwell time extension Requested (CLIENT_ID  provided)';
+V_QUOTE8 VARCHAR2(100):='No Parcels are updated';
+V_QUOTE9 VARCHAR2(100):='Dwell time extension Requested (CLIENT_ID not provided)';
+V_QUOTE10 VARCHAR2(100):='Invalid Parameters';
+V_QUOTE11 VARCHAR2(100):='Extend Dwell Time';
+V_QUOTE12 VARCHAR2(100):='Success';
+V_QUOTE13 VARCHAR2(100):='Failure';
+V_QUOTE14 VARCHAR2(100):='Parcels partially updated';
+
+V_PROC_NAME VARCHAR2(50):='PR_UPDATE_DWELL_TIME';
+V_TAB_NAME  VARCHAR2(50):='CONNECT_PARCEL_LATEST_TRANS';
+
+V_ERROR_CODE1 VARCHAR2(10):='000';
+V_ERROR_CODE2 VARCHAR2(10):='633';--'500' Commented on 07-May-2015
+V_ERROR_CODE3 VARCHAR2(10):='204';
+V_ERROR_CODE4 VARCHAR2(10):='400';
+
+V_ERROR_CODE5 VARCHAR2(10):='617'; --EXTENDED OLRDY
+V_ERROR_CODE6 VARCHAR2(10):='618'; --NOT CORREST STATUS
+V_ERROR_CODE7 VARCHAR2(10):='111'; --B failure
+V_ERROR_CODE8 VARCHAR2(10):='001'; --Partial
+V_OBJ_ERR_CODE VARCHAR2(50);
+V_OPERATION_NAME VARCHAR2(1000);
+
+J NUMBER:=0;
+I NUMBER:=0;
+K NUMBER:=0;
+
+V_DEFAULT VARCHAR2(1000);
+V_FACILITY_TYPE VARCHAR2(1000);
+V_EXTEND_VAL NUMBER;
+V_COUNT_CHECK NUMBER;
+
+
+CURSOR CUR_PARCEL
+IS
+      SELECT A.PARCEL_NUMBER
+        FROM CONNECT_PARCEL_STATE A,
+             CONNECT_PARCEL_LATEST_TRANS B
+       WHERE A.PARCEL_NUMBER=B.PARCEL_NUMBER
+         AND A.ORDER_NUMBER=ORDER_NUMBER_IN
+         AND A.CLIENT_ID=CLIENT_ID_IN
+         AND B.STATUS_ID IN (SELECT STATUS_ID FROM CONNECT_STATUS_MASTER WHERE STATUS_NAME IN ('Ready for Collection','Force Putaway'));
+
+BEGIN
+
+  V_OPERATION_NAME:='Start';
+
+IF ORDER_NUMBER_IN IS NOT NULL AND CLIENT_ID_IN IS NOT NULL THEN
+
+DWELL_RESPONSE_F:=OBJ_DWELL_STATUS_FAILURE_TBL();
+DWELL_RESPONSE_S:=OBJ_DWELL_STATUS_SUCCESS_TBL();
+
+  OPEN CUR_PARCEL;
+
+  LOOP
+
+ V_OPERATION_NAME:='Fetching Parcel details';
+
+  FETCH CUR_PARCEL INTO V_PARCEL_NUMBER;
+
+V_QUOTE3 :='Dwell time extension failed. Already Updated: '||V_PARCEL_NUMBER;
+V_QUOTE4 :='Dwell time extension failed. Not ready for Collection: '||V_PARCEL_NUMBER;
+V_QUOTE5 :='Dwell time extension failed. Dwell time is not set for '||V_PARCEL_NUMBER;
+
+
+          EXIT WHEN CUR_PARCEL%NOTFOUND;
+
+
+
+                    --LOCAL BLOCK--
+                      BEGIN
+
+					   V_OPERATION_NAME:='Fetching attributes';
+ ---------------------------------------------------------------------CR0018 START-----------------------------------------------------
+                            SELECT FINAL_DESTINATION_TYPE
+                            INTO V_FACILITY_TYPE
+                            FROM CONNECT_PARCEL_STATE
+                            WHERE PARCEL_NUMBER=V_PARCEL_NUMBER;
+
+                            SELECT COUNT(1)
+                            INTO V_COUNT_CHECK
+                            FROM CONNECT_DATA_CONFIG
+                            WHERE CONFIG_NAME=V_FACILITY_TYPE
+                            AND CONFIG_TYPE  ='Dwell Time Extension Period';
+
+                            IF V_COUNT_CHECK =0 THEN
+                              SELECT TO_NUMBER(CONFIG_VALUE)
+                              INTO V_EXTEND_VAL
+                              FROM CONNECT_DATA_CONFIG
+                              WHERE CONFIG_NAME='Default'
+                              AND CONFIG_TYPE  ='Dwell Time Extension Period';
+                            ELSE
+                              SELECT TO_NUMBER(CONFIG_VALUE)
+                              INTO V_EXTEND_VAL
+                              FROM CONNECT_DATA_CONFIG
+                              WHERE CONFIG_NAME=V_FACILITY_TYPE
+                              AND CONFIG_TYPE  ='Dwell Time Extension Period';
+                            END IF;
+ ---------------------------------------------------------------------CR0018 END-----------------------------------------------------
+
+                         SELECT CPLT.DWELL_TIME AS DWELL_DATE,
+                         --SELECT TRUNC(CPLT.DWELL_TIME) AS DWELL_DATE,
+                           CASE CPLT.DWELL_TIME_UPDATE_FLAG
+                                WHEN 'Y'  THEN V_QUOTE13
+                                ELSE V_QUOTE12
+                            END SUCCESS_FLAG,
+                                STATUS_ID,
+                                DWELL_TIME_UPDATE_FLAG
+                           INTO V_DWELL_DATE,
+                                V_VAR1,
+                                V_STATUS,
+                                V_FLAG
+                          FROM CONNECT_PARCEL_LATEST_TRANS CPLT
+                          WHERE CPLT.PARCEL_NUMBER=V_PARCEL_NUMBER;
+
+						  V_OPERATION_NAME:='checking dwell time';
+
+                            IF V_DWELL_DATE IS NOT NULL THEN
+
+                              SELECT STATUS_ID
+                                INTO V_VAR4
+                                FROM CONNECT_STATUS_MASTER CSM
+                               WHERE CSM.STATUS_NAME=V_QUOTE1;
+
+							   V_OPERATION_NAME:='checking status';
+
+                                IF V_STATUS =V_VAR4 OR  V_STATUS =12 THEN  -- changed for forced putaway
+
+                                V_OPERATION_NAME:='checking update flag';
+
+                                    IF V_FLAG IS  NULL THEN
+
+                                        I:=I+1;
+
+								      V_OPERATION_NAME:='Begin Update';
+
+                                        --actual update--
+                                        UPDATE CONNECT_PARCEL_LATEST_TRANS A
+                                        SET   A.DWELL_TIME_UPDATE_FLAG='Y',
+                                              A.DWELL_TIME            =(A.DWELL_TIME+V_EXTEND_VAL),
+                                              A.UPDATED_BY            =USER_ID_IN,
+                                              A.UPDATED_DATE          =SYSDATE
+                                        WHERE A.PARCEL_NUMBER         =V_PARCEL_NUMBER;
+
+                                      V_DWELL_DATE:=V_DWELL_DATE+V_EXTEND_VAL;
+                                      V_VAR1:=V_QUOTE2; --Success
+
+                                      DWELL_RESPONSE_S.EXTEND;
+                                      DWELL_RESPONSE_S(I):=OBJ_DWELL_STATUS_SUCCESS(V_PARCEL_NUMBER,V_DWELL_DATE,V_VAR1,V_ERROR_CODE1);
+
+                                     ELSE
+
+									        V_OPERATION_NAME:='User defined Exp 1';
+                                          V_VAR1:=V_QUOTE3;
+                                          V_OBJ_ERR_CODE:=V_ERROR_CODE5;
+                                          RAISE EXP_BUSINNES_LGC; --FLAG Y
+                                     END IF;
+
+                                  ELSE
+										V_OPERATION_NAME:='User defined Exp 2';
+                                      V_VAR1:=V_QUOTE4;
+                                      V_OBJ_ERR_CODE:=V_ERROR_CODE6;
+                                      RAISE EXP_BUSINNES_LGC; --STATUS ALADA
+                                  END IF;
+
+                                ELSE
+									 V_OPERATION_NAME:='User defined Exp 3';
+                                    V_VAR1:=V_QUOTE5;
+                                    V_OBJ_ERR_CODE:=V_ERROR_CODE6;
+                                    RAISE EXP_BUSINNES_LGC; --DATE NULL
+                                END IF;
+
+
+
+                      EXCEPTION
+
+                            WHEN EXP_BUSINNES_LGC THEN
+
+                            J:=J+1;
+
+                            DWELL_RESPONSE_F.EXTEND;
+                            DWELL_RESPONSE_F(J):=OBJ_DWELL_STATUS_FAILURE(V_PARCEL_NUMBER,V_DWELL_DATE,V_VAR1,V_OBJ_ERR_CODE);
+
+                            INSERT INTO CONNECT_LOG
+                                      (
+                                       PROCEDURE_NAME,
+                                       TABLE_NAME,
+                                       OPERATION_NAME,
+                                       MESSAGE,
+                                       OPERATION_DATE,
+                                       RESPONSE_CODE
+                                       )
+                                      VALUES
+                                        (
+                                        V_PROC_NAME,
+                                        V_TAB_NAME,
+                                        V_OPERATION_NAME,
+                                        V_VAR1,
+                                        SYSDATE,
+                                        V_OBJ_ERR_CODE
+                                        );
+
+
+                                        COMMIT;
+
+                            WHEN OTHERS THEN
+
+                            V_VAR2:='Error : '||SQLCODE||' - '||SQLERRM;
+                            V_VAR1:=V_QUOTE6;
+                            V_ERR_CODE:=V_ERROR_CODE2;
+
+                            INSERT INTO CONNECT_LOG
+                                     (
+                                       PROCEDURE_NAME,
+                                       TABLE_NAME,
+                                       OPERATION_NAME,
+                                       MESSAGE,
+                                       OPERATION_DATE,
+                                       RESPONSE_CODE
+                                       )
+                                      VALUES
+                                        (
+                                        V_PROC_NAME,
+                                        V_TAB_NAME,
+                                        v_OPERATION_NAME||'- In Block',
+                                        V_VAR2,
+                                        SYSDATE,
+                                       V_ERR_CODE
+                                        );
+                            COMMIT;
+
+                      END ;
+
+              --Audit data--
+              INSERT INTO CONNECT_USER_AUDIT
+                (
+                  USER_ID,
+                  PACKAGE_NUMBER,
+                  STORE_NUMBER,
+                  ACTION_TYPE,
+                  MESSAGE,
+                  AUDIT_CREATE_DATE,
+                  PACKAGE_TYPE
+                )
+                VALUES
+                (
+                  USER_ID_IN,
+                  V_PARCEL_NUMBER,
+                  ORIGIN_ID_IN,
+                  V_QUOTE11,
+                  V_QUOTE7,
+                  SYSDATE,
+                  'Parcel'
+                );
+--
+          END LOOP;
+--
+          CLOSE CUR_PARCEL;
+--
+
+
+ELSIF  ORDER_NUMBER_IN IS NULL OR CLIENT_ID_IN IS NULL THEN
+
+DWELL_RESPONSE_F:=OBJ_DWELL_STATUS_FAILURE_TBL();
+DWELL_RESPONSE_S:=OBJ_DWELL_STATUS_SUCCESS_TBL();
+
+        -- For parcel level input --
+        FOR I IN 1..DWELL_DETAILS.COUNT LOOP
+
+          IF    V_FLAG2='Found' THEN
+          J:=J+1;
+          END IF;
+
+        V_PARCEL_NUMBER:=DWELL_DETAILS(I).PARCEL_NUMBER;
+        V_OBJ_ERR_CODE :=V_ERROR_CODE3;
+
+        ---------------------------------------------------------------------CR0018 START-----------------------------------------------------
+                            SELECT FINAL_DESTINATION_TYPE
+                            INTO V_FACILITY_TYPE
+                            FROM CONNECT_PARCEL_STATE
+                            WHERE PARCEL_NUMBER=V_PARCEL_NUMBER;
+
+                            SELECT COUNT(1)
+                            INTO V_COUNT_CHECK
+                            FROM CONNECT_DATA_CONFIG
+                            WHERE CONFIG_NAME=V_FACILITY_TYPE
+                            AND CONFIG_TYPE  ='Dwell Time Extension Period';
+
+                            IF V_COUNT_CHECK =0 THEN
+                              SELECT  TO_NUMBER(CONFIG_VALUE)
+                              INTO V_EXTEND_VAL
+                              FROM CONNECT_DATA_CONFIG
+                              WHERE CONFIG_NAME='Default'
+                              AND CONFIG_TYPE  ='Dwell Time Extension Period';
+                            ELSE
+                              SELECT  TO_NUMBER(CONFIG_VALUE)
+                              INTO V_EXTEND_VAL
+                              FROM CONNECT_DATA_CONFIG
+                              WHERE CONFIG_NAME=V_FACILITY_TYPE
+                              AND CONFIG_TYPE  ='Dwell Time Extension Period';
+                            END IF;
+ ---------------------------------------------------------------------CR0018 END-----------------------------------------------------
+
+
+
+          V_QUOTE3 :='Dwell time extension failed: Already Updated: '||V_PARCEL_NUMBER;
+          V_QUOTE4 :='Dwell time extension failed: Not ready for Collection: '||V_PARCEL_NUMBER;
+          V_QUOTE5 :='Dwell time extension failed. Dwell time is not set for '||V_PARCEL_NUMBER;
+                      --LOCAL BLOCK--  --V_PARCEL_NUMBER,V_DWELL_DATE,V_VAR1,V_OBJ_ERR_CODE
+                      BEGIN
+
+                           SELECT CPLT.DWELL_TIME AS DWELL_DATE,
+                           CASE CPLT.DWELL_TIME_UPDATE_FLAG
+                                WHEN 'Y'  THEN 'FAILURE'
+                                ELSE 'SUCCESS'
+                            END SUCCESS_FLAG,
+                                STATUS_ID,
+                                DWELL_TIME_UPDATE_FLAG
+                           INTO V_DWELL_DATE,
+                                V_VAR1,
+                                V_STATUS,
+                                V_FLAG
+                          FROM CONNECT_PARCEL_LATEST_TRANS CPLT
+                          WHERE CPLT.PARCEL_NUMBER=V_PARCEL_NUMBER;
+
+                            IF V_DWELL_DATE IS NOT NULL THEN
+
+                              SELECT STATUS_ID
+                                INTO V_VAR4
+                                FROM CONNECT_STATUS_MASTER CSM
+                               WHERE CSM.STATUS_NAME=V_QUOTE1;
+
+                                IF V_STATUS =V_VAR4 OR V_STATUS =12  THEN  --changed for force putaway
+
+                                    IF V_FLAG IS  NULL THEN
+
+                                          --actual update--
+                                        UPDATE CONNECT_PARCEL_LATEST_TRANS A
+                                        SET A.DWELL_TIME_UPDATE_FLAG  ='Y',
+                                          A.DWELL_TIME                =(A.DWELL_TIME+V_EXTEND_VAL),
+                                          A.UPDATED_BY                =USER_ID_IN,
+                                          A.UPDATED_DATE              =SYSDATE
+                                        WHERE A.PARCEL_NUMBER         =V_PARCEL_NUMBER;
+
+                                        K:=K+1;
+
+                                     V_DWELL_DATE:=V_DWELL_DATE+V_EXTEND_VAL;
+                                     V_VAR1:=V_QUOTE2; --Success
+
+                                     ELSE
+                                          V_VAR1:=V_QUOTE3;
+                                          V_OBJ_ERR_CODE:=V_ERROR_CODE5;
+                                          RAISE EXP_BUSINNES_LGC; --FLAG Y
+                                     END IF;
+
+                                  ELSE
+                                      V_VAR1:=V_QUOTE4;
+                                      V_OBJ_ERR_CODE:=V_ERROR_CODE6;
+                                      RAISE EXP_BUSINNES_LGC; --STATUS ALADA
+                                  END IF;
+
+                                ELSE
+                                    V_VAR1:=V_QUOTE5;
+                                    V_OBJ_ERR_CODE:=V_ERROR_CODE6;
+
+                                    RAISE EXP_BUSINNES_LGC; --DATE NULL
+                                END IF;
+
+                             DWELL_RESPONSE_S.EXTEND;
+
+                             DWELL_RESPONSE_S(K):=OBJ_DWELL_STATUS_SUCCESS(V_PARCEL_NUMBER,V_DWELL_DATE,V_VAR1,V_ERROR_CODE1);
+                             V_FLAG2:='Not Found';
+
+                      EXCEPTION
+
+                            WHEN EXP_BUSINNES_LGC THEN
+
+                            V_FLAG2:='Found';
+                            DWELL_RESPONSE_F.EXTEND;
+                            DWELL_RESPONSE_F(J):=OBJ_DWELL_STATUS_FAILURE(V_PARCEL_NUMBER,V_DWELL_DATE,V_VAR1,V_OBJ_ERR_CODE);
+
+                            INSERT INTO CONNECT_LOG
+                                      (
+                                       PROCEDURE_NAME,
+                                       TABLE_NAME,
+                                       OPERATION_NAME,
+                                       MESSAGE,
+                                       OPERATION_DATE,
+                                       RESPONSE_CODE
+                                       )
+                                      VALUES
+                                        (
+                                        V_PROC_NAME,
+                                        V_TAB_NAME,
+                                        V_QUOTE11,
+                                        V_VAR1,
+                                        SYSDATE ,
+                                        V_ERR_CODE
+                                        );
+                            COMMIT;
+
+                            WHEN NO_DATA_FOUND THEN
+
+                            V_FLAG2:='Found';
+                            DWELL_RESPONSE_F.EXTEND;
+                            DWELL_RESPONSE_F(J):=OBJ_DWELL_STATUS_FAILURE(V_PARCEL_NUMBER,V_DWELL_DATE,V_VAR1,V_OBJ_ERR_CODE);
+
+                            INSERT INTO CONNECT_LOG
+                                      (
+                                       PROCEDURE_NAME,
+                                       TABLE_NAME,
+                                       OPERATION_NAME,
+                                       MESSAGE,
+                                       OPERATION_DATE,
+                                       RESPONSE_CODE
+                                       )
+                                      VALUES
+                                        (
+                                        V_PROC_NAME,
+                                        V_TAB_NAME,
+                                        V_QUOTE11,
+                                        V_VAR1,
+                                        SYSDATE ,
+                                        V_ERR_CODE
+                                        );
+                            COMMIT;
+
+                            WHEN OTHERS THEN
+                            V_VAR2:='Error : '||SQLCODE||' - '||SQLERRM;
+                            V_VAR1:=V_QUOTE6;
+                            V_ERR_CODE:=V_ERROR_CODE2;
+
+                            INSERT INTO CONNECT_LOG
+                                      (
+                                       PROCEDURE_NAME,
+                                       TABLE_NAME,
+                                       OPERATION_NAME,
+                                       MESSAGE,
+                                       OPERATION_DATE,
+                                       RESPONSE_CODE
+                                       )
+                                      VALUES
+                                        (
+                                        V_PROC_NAME,
+                                        V_TAB_NAME,
+                                        V_QUOTE11||' --In Block',
+                                        V_VAR2,
+                                        SYSDATE,
+                                        V_ERR_CODE
+                                        );
+                            COMMIT;
+
+                      END ;
+
+              --Audit data--
+              INSERT INTO CONNECT_USER_AUDIT
+                (
+                  USER_ID,
+                  PACKAGE_NUMBER,
+                  STORE_NUMBER,
+                  ACTION_TYPE,
+                  MESSAGE,
+                  AUDIT_CREATE_DATE,
+                  PACKAGE_TYPE
+                )
+                VALUES
+               (
+                  USER_ID_IN,
+                  V_PARCEL_NUMBER,
+                  ORIGIN_ID_IN,
+                  V_QUOTE11,
+                  V_QUOTE9,
+                  SYSDATE,
+                  'Parcel'
+                );
+
+        END LOOP;
+
+ELSE
+
+V_DB_RESPONSE:=V_QUOTE10;
+V_ERR_CODE:=V_ERROR_CODE4;
+
+END IF;
+
+
+IF DWELL_RESPONSE_S.COUNT    =0 AND DWELL_RESPONSE_F.COUNT=0 THEN
+  V_DB_RESPONSE             :=V_QUOTE8;
+  V_ERR_CODE                :=V_ERROR_CODE7;
+
+
+ELSIF DWELL_RESPONSE_S.COUNT > 0 AND DWELL_RESPONSE_F.COUNT=0 THEN
+  V_DB_RESPONSE             :=V_QUOTE12;
+  V_ERR_CODE                :=V_ERROR_CODE1;
+ELSIF DWELL_RESPONSE_S.COUNT > 0 AND DWELL_RESPONSE_F.COUNT>0 THEN
+
+--      IF V_COUNT =1 AND  V_CODE ='204' THEN
+--      V_FLAG1:='Not Found Scenario';
+--      V_ERR_CODE                :=V_ERROR_CODE7;
+--
+--      END IF;
+
+  V_DB_RESPONSE             :=V_QUOTE14;
+  V_ERR_CODE                :=V_ERROR_CODE8;
+ELSIF DWELL_RESPONSE_S.COUNT =0 AND DWELL_RESPONSE_F.COUNT>0 THEN
+  V_DB_RESPONSE             :=V_QUOTE8;
+  V_ERR_CODE                :=V_ERROR_CODE7;
+END IF;
+
+COMMIT;
+
+--Global exception--
+EXCEPTION
+
+
+WHEN OTHERS THEN
+ROLLBACK;
+
+V_VAR1:='Error : '||SQLCODE||' - '||SQLERRM;
+V_ERR_CODE:=V_ERROR_CODE2;
+V_DB_RESPONSE:=V_QUOTE6;
+
+INSERT INTO CONNECT_LOG
+  (
+    PROCEDURE_NAME,
+    TABLE_NAME,
+    OPERATION_NAME,
+    MESSAGE,
+    OPERATION_DATE,
+    RESPONSE_CODE
+  )
+  VALUES
+  (
+    V_PROC_NAME,
+    V_TAB_NAME,
+    V_OPERATION_NAME,
+    V_VAR1,
+    SYSDATE,
+    V_ERR_CODE
+  );
+COMMIT;
+
+V_DB_RESPONSE:=V_QUOTE13;
+
+END PR_UPDATE_DWELL_TIME;
+
+PROCEDURE PR_COMPLETE_COLLECTION(USER_ID             IN  VARCHAR2,
+                                 ORIGIN_ID           IN  VARCHAR2,
+                                 ORDER_NUMBER_IN        IN VARCHAR2, --Changed on 22-Jun-2015
+                                 esign                IN CLOB,
+                                 COLLECT_IN          IN T_COLLECTION_ARY,
+                                 VERIFICATION_ID_IN  IN VARCHAR2,
+                                 COLLECT_OUT      OUT T_COLLECTION_OUTARY,
+                                 CONFIRMATION_MSG OUT VARCHAR2,
+                                 PRETERR OUT VARCHAR2,
+                                 LATEST_TASK_ID	OUT CONNECT_TASK_DETAILS.TASK_ID%type,
+                                 V_ACTIVE_TASK_CNT	OUT NUMBER,
+                                 V_ACK_TASK_CNT OUT NUMBER
+) IS
+
+  V_DO_NUMBER            VARCHAR2(30);
+  V_DELIVERY_NUMBER      VARCHAR2(30);
+  V_PARCEL_NUMBER        VARCHAR2(30);
+  V_FINAL_DESTINATION_ID VARCHAR2(30);
+
+  V_ORDER_NUMBER VARCHAR2(20);
+  V_CLIENT_ID    VARCHAR2(50);
+  V_TASK_ID      VARCHAR2(30);
+  V_ORIGIN_ID    VARCHAR2(30);
+  V_ORIGIN_FROM  VARCHAR2(30);
+
+  V_ERR_COUNT          NUMBER;
+
+  V_PROCEDURE_NAME VARCHAR2(30);
+  V_TABLE_NAME     VARCHAR2(30);
+  V_OPERATION_NAME VARCHAR2(100);
+  V_MESSAGE        VARCHAR2(1000);
+
+  V_PARCEL_CNT  NUMBER;
+  V_ORDER_CNT   NUMBER;
+  V_TOTAL_PARCEL NUMBER;
+
+  V_RETRIEVE_DATE     DATE;
+  V_TASK_CREATE_DATE  DATE;
+
+  idx  pls_integer;
+  --idx1 pls_integer;
+
+  V_SERV_ITEM_NAME  connect_parcel_service_trans.service_name%TYPE ; --VARCHAR2(50);  -- 07122015 For email ID Size
+
+BEGIN
+  --pRetCode         := 0;
+  pRetErr          := NULL;
+  V_PROCEDURE_NAME := 'PR_COMPLETE_COLLECTION';
+  CONFIRMATION_MSG := NULL;
+
+  V_ERR_COUNT          := 0;
+
+  SELECT COUNT(1)
+      INTO V_ORDER_CNT
+      FROM CONNECT_PARCEL_STATE CPS
+     WHERE CPS.order_number = ORDER_NUMBER_IN;
+
+    ---DBMS_OUTPUT.put_line('Invalid Order No '||V_ORDER_CNT);
+
+    IF V_ORDER_CNT = 0 THEN
+
+      -- preterr          := '204';
+      --CONFIRMATION_MSG := 'No Content';
+    --ROLLBACK;
+     COLLECT_OUT := T_COLLECTION_OUTARY();
+    COLLECT_OUT.EXTEND;
+              COLLECT_OUT(1) := T_COLLECTION_OUT(NULL,--'DO Ship Confirmed',
+                                                   NULL,--V_DO_NUMBER,
+                                                   NULL,--V_DELIVERY_NUMBER,
+                                                   NULL,--V_PARCEL_NUMBER,
+                                                   NULL,--V_FINAL_DESTINATION_ID,
+                                                   ORDER_NUMBER_IN,
+                                                   NULL,--V_TASK_ID,
+                                                   NULL,--ORIGIN_ID
+                                                   NULL,--V_ORIGIN_FROM,
+                                                   'No Content',
+                                                   NULL,--ADDED ON 29-MAY-2015
+                                                   '204'
+                                                   );
+
+    V_MESSAGE := 'Invalid Input parameter Order Number '||ORDER_NUMBER_IN;
+
+
+
+    INSERT INTO CONNECT_LOG
+      (PROCEDURE_NAME,
+       TABLE_NAME,
+       OPERATION_NAME,
+       RESPONSE_CODE,
+       MESSAGE,
+       OPERATION_DATE)
+    VALUES
+      (V_PROCEDURE_NAME,
+       'CONNECT_PARCEL_STATE',
+       'Check Input Parameter',
+       '204',
+       V_MESSAGE,
+       SYSDATE);
+
+    COMMIT;
+
+
+    ELSE
+
+  COLLECT_OUT := T_COLLECTION_OUTARY();
+
+  V_TOTAL_PARCEL := COLLECT_IN.COUNT;
+
+
+
+
+  --DBMS_OUTPUT.put_line('Total No of Parcels '||V_TOTAL_PARCEL);
+
+  /* UPDATE CONNECT_PARCEL_LATEST_TRANS TABLE for PARCELS to be collected */
+  V_TABLE_NAME     := 'CONNECT_PARCEL_LATEST_TRANS';
+  V_OPERATION_NAME := 'UPDATE';
+
+
+  idx := COLLECT_IN.first;
+
+  loop
+    exit when idx is null;
+
+           SELECT COUNT(1)
+            INTO V_PARCEL_CNT
+            FROM CONNECT_PARCEL_STATE CPS
+           WHERE CPS.PARCEL_NUMBER = COLLECT_IN(idx).PARCEL_NO;
+
+           IF V_PARCEL_CNT = 0 THEN
+
+           -- preterr          := 'No Content';
+           -- CONFIRMATION_MSG := '204';
+
+           --dbms_output.put_line('Parcel Check '||COLLECT_IN(idx).PARCEL_NO);
+
+            COLLECT_OUT.EXTEND;
+              COLLECT_OUT(idx) := T_COLLECTION_OUT(NULL,--'DO Ship Confirmed',
+                                                   NULL,--V_DO_NUMBER,
+                                                   NULL,--V_DELIVERY_NUMBER,
+                                                   COLLECT_IN(idx).PARCEL_NO,--V_PARCEL_NUMBER,
+                                                   NULL,--V_FINAL_DESTINATION_ID,
+                                                   ORDER_NUMBER_IN,
+                                                   NULL,--V_TASK_ID,
+                                                   ORIGIN_ID,
+                                                   NULL,--V_ORIGIN_FROM,
+                                                   'No Content',
+                                                   NULL,--ADDED ON 29-MAY-2015
+                                                   '204'
+                                                   );
+          --ROLLBACK;
+
+          V_MESSAGE := 'Invalid Input parameter Parcel Number '||COLLECT_IN(idx).PARCEL_NO;
+
+          INSERT INTO CONNECT_LOG
+            (PROCEDURE_NAME,
+             TABLE_NAME,
+             OPERATION_NAME,
+             RESPONSE_CODE,
+             MESSAGE,
+             OPERATION_DATE)
+          VALUES
+            (V_PROCEDURE_NAME,
+             'CONNECT_PARCEL_STATE',
+             'Check Input Parameter',
+             '204',
+             V_MESSAGE,
+             SYSDATE);
+
+          V_ERR_COUNT := V_ERR_COUNT + 1;
+
+          COMMIT;
+
+
+          ELSE
+
+    --dbms_output.put_line('Parcel Status Check '||COLLECT_IN(idx).PARCEL_NO);
+       ----
+
+           SELECT COUNT(1)
+            INTO V_PARCEL_CNT
+            FROM CONNECT_PARCEL_LATEST_TRANS CPLT, CONNECT_STATUS_MASTER CSM
+           WHERE CPLT.PARCEL_NUMBER = COLLECT_IN(idx).PARCEL_NO
+             AND   CPLT.STATUS_ID = CSM.STATUS_ID
+             AND CSM.STATUS_NAME IN ('Ready for Collection','Received','Force Putaway');
+
+           IF V_PARCEL_CNT = 0 THEN
+
+            --preterr          := 'Parcel is not in valid state for collection';
+            --CONFIRMATION_MSG := '602';
+
+            COLLECT_OUT.EXTEND;
+              COLLECT_OUT(idx) := T_COLLECTION_OUT(NULL,--'DO Ship Confirmed',
+                                                   NULL,--V_DO_NUMBER,
+                                                   NULL,--V_DELIVERY_NUMBER,
+                                                   COLLECT_IN(idx).PARCEL_NO,--V_PARCEL_NUMBER,
+                                                   NULL,--V_FINAL_DESTINATION_ID,
+                                                   ORDER_NUMBER_IN,
+                                                   NULL,--V_TASK_ID,
+                                                   ORIGIN_ID,
+                                                   NULL,--V_ORIGIN_FROM,
+                                                   'Parcel is not in valid state for collection',
+                                                   NULL,--ADDED ON 29-MAY-2015
+                                                   '602');
+          --ROLLBACK;
+
+          V_MESSAGE := 'Parcel '||COLLECT_IN(idx).PARCEL_NO||' is not in valid state for collection ';
+
+          INSERT INTO CONNECT_LOG
+            (PROCEDURE_NAME,
+             TABLE_NAME,
+             OPERATION_NAME,
+             RESPONSE_CODE,
+             MESSAGE,
+             OPERATION_DATE)
+          VALUES
+            (V_PROCEDURE_NAME,
+             'CONNECT_PARCEL_STATE',
+             'Check Input Parameter',
+             '602',
+             V_MESSAGE,
+             SYSDATE);
+
+          V_ERR_COUNT := V_ERR_COUNT + 1;
+
+          COMMIT;
+
+       ----
+       ELSE
+
+       --dbms_output.put_line('Parcel Collected '||COLLECT_IN(idx).PARCEL_NO);
+
+        begin
+              SELECT B.DO_NUMBER,
+                     B.DELIVERY_NUMBER,
+                     B.PARCEL_NUMBER,
+                     B.FINAL_DESTINATION_ID,
+                     B.ORDER_NUMBER,
+                     B.CLIENT_ID
+                INTO V_DO_NUMBER,
+                     V_DELIVERY_NUMBER,
+                     V_PARCEL_NUMBER,
+                     V_FINAL_DESTINATION_ID,
+                     V_ORDER_NUMBER,
+                     V_CLIENT_ID
+                 FROM CONNECT_PARCEL_STATE B
+                 WHERE B.PARCEL_NUMBER = COLLECT_IN(idx).PARCEL_NO;
+                exception
+                WHEN OTHERS THEN
+                     V_DO_NUMBER      := NULL;
+                     V_DELIVERY_NUMBER:= NULL;
+                     V_PARCEL_NUMBER:=NULL;
+                     V_FINAL_DESTINATION_ID:=NULL;
+                     V_ORDER_NUMBER:=NULL;
+                     V_CLIENT_ID:=NULL;
+                end;
+
+        --****
+         begin
+
+         SELECT    TASK_ID,
+                   ORIGIN_ID,
+                   ORIGIN_FROM
+         INTO V_TASK_ID,
+                     V_ORIGIN_ID,
+                     V_ORIGIN_FROM
+        FROM (
+              SELECT C.TASK_ID,
+                     C.ORIGIN_ID,
+                     C.ORIGIN_FROM,
+                     --ROW_NUMBER() OVER (PARTITION BY C.TASK_ID, C.ORIGIN_ID, C.ORIGIN_FROM ORDER BY TASK_CREATE_DATE DESC) RN
+                     ROW_NUMBER() OVER (PARTITION BY C.TASK_DETAILS, C.CLIENT_ID ORDER BY TASK_CREATE_DATE DESC) RN   --CHANGED ON 11-JUN-2015
+                FROM CONNECT_TASK_DETAILS C
+               WHERE trunc(C.TASK_UPDATE_DATE) =
+                     trunc(COLLECT_IN(idx).ORDER_COLLECT_DATE)
+                AND  C.TASK_DETAILS = ORDER_NUMBER_IN
+                AND C.CLIENT_ID = V_CLIENT_ID
+               ) WHERE RN=1
+                ;
+         exception
+             WHEN OTHERS THEN
+             V_TASK_ID := NULL;
+             V_ORIGIN_ID := NULL;
+             V_ORIGIN_FROM := NULL;
+
+          END;
+
+        ---****
+        --dbms_output.put_line('Hello1  '||V_ORIGIN_FROM);
+
+                      ---new 29-jan-2015
+
+        UPDATE CONNECT_PARCEL_LATEST_TRANS CPLT
+           SET CPLT.STATUS_ID = (SELECT STATUS_ID
+                                   FROM CONNECT_STATUS_MASTER CSM
+                                  WHERE CSM.STATUS_NAME = 'Collected'),
+               CPLT.TASK_ID = V_TASK_ID ,
+               CPLT.UPDATED_BY = USER_ID,
+               CPLT.UPDATED_DATE = SYSDATE
+         WHERE CPLT.PARCEL_NUMBER = COLLECT_IN(idx).PARCEL_NO
+           /*AND CPLT.STATUS_ID =
+               (SELECT STATUS_ID
+                  FROM CONNECT_STATUS_MASTER CSM
+                 WHERE CSM.STATUS_NAME = 'Ready for Collection') */;
+
+          ---
+          BEGIN
+          SELECT MAX(RETRIEVE_DATE)     --2.2 Change Collect duration
+            INTO V_RETRIEVE_DATE
+            FROM CONNECT_COLLECT_TEMP CCT
+           WHERE CCT.order_number = ORDER_NUMBER_IN   --- Changed version 2.0
+             AND CCT.client_id = V_CLIENT_ID;
+          EXCEPTION
+          WHEN OTHERS THEN
+          V_RETRIEVE_DATE    := NULL;
+          --V_TASK_CREATE_DATE := NULL;
+          END;
+
+           BEGIN
+          SELECT MAX(TASK_CREATE_DATE)  --2.2 Change Collect duration
+            INTO V_TASK_CREATE_DATE
+            FROM CONNECT_COLLECT_TEMP CCT
+           WHERE CCT.order_number = ORDER_NUMBER_IN   --- Changed version 2.0
+             AND CCT.client_id = V_CLIENT_ID;
+          EXCEPTION
+          WHEN OTHERS THEN
+          --V_RETRIEVE_DATE    := NULL;
+          V_TASK_CREATE_DATE := NULL;
+          END;
+          ---
+
+              INSERT INTO Connect_Parcel_Collect
+                (COLLECTION_ID,
+                 ORDER_NUMBER,
+                 CUSTOMER_SIGN,
+                 PARCEL_NUMBER,
+                 PARCEL_COLLECT_DATE,
+                 CLIENT_ID,
+                 STORE_ID,
+                 CREATED_BY,
+                 CREATED_DATE,
+                 RETRIEVE_DATE,
+                 TASK_CREATE_DATE,
+                 VERIFICATION_ID)
+              VALUES
+                (SEQ_COLLECT_ID.NEXTVAL,
+                 ORDER_NUMBER_IN,
+                 esign  ,
+                 COLLECT_IN(idx).PARCEL_NO,
+                 COLLECT_IN(idx).ORDER_COLLECT_DATE,
+                 V_CLIENT_ID,
+                 V_FINAL_DESTINATION_ID,
+                 --'Collection',
+                 USER_ID,
+                 SYSDATE,
+                 V_RETRIEVE_DATE,
+                 V_TASK_CREATE_DATE,
+                 VERIFICATION_ID_IN);
+
+       /*   DELETE FROM  CONNECT_COLLECT_TEMP CCT
+           WHERE CCT.order_number = ORDER_NUMBER
+             AND CCT.client_id = V_CLIENT_ID;  */
+
+                 ----
+          INSERT INTO CONNECT_USER_AUDIT
+            (USER_ID,
+             PACKAGE_NUMBER,
+             PACKAGE_TYPE,
+             STORE_NUMBER,
+             ACTION_TYPE,
+             MESSAGE,
+             AUDIT_CREATE_DATE)
+          VALUES
+            (USER_ID,
+             COLLECT_IN(idx).PARCEL_NO,
+             'PARCEL',
+             V_FINAL_DESTINATION_ID,
+             'Complete Collection',
+             'Parcel number: ' || COLLECT_IN(idx).PARCEL_NO || 'is collected',
+             SYSDATE);
+                 ----
+
+            ----------ADDED ON 29-MAY-2015---
+         BEGIN
+
+         SELECT service_name
+         INTO V_SERV_ITEM_NAME
+         FROM  connect_parcel_service_trans
+         WHERE parcel_number = COLLECT_IN(idx).PARCEL_NO
+         AND  service_type = 'Segregation'
+         AND ROWNUM < 2;
+
+         EXCEPTION
+         WHEN OTHERS THEN
+         V_SERV_ITEM_NAME := NULL;
+         END;
+
+            ------------ADDED ON 29-MAY-2015----
+           --dbms_output.put_line('Hello2  '||V_ORIGIN_FROM);
+              DELETE FROM CONNECT_LOC_PKG_TRANS
+               WHERE PARCEL_NUMBER = COLLECT_IN(idx).PARCEL_NO;
+
+              COLLECT_OUT.EXTEND;
+              COLLECT_OUT(idx) := T_COLLECTION_OUT('DO Ship Confirmed',
+                                                   V_DO_NUMBER,
+                                                   V_DELIVERY_NUMBER,
+                                                   COLLECT_IN(idx).PARCEL_NO,
+                                                   V_FINAL_DESTINATION_ID,
+                                                   ORDER_NUMBER_IN,
+                                                   V_TASK_ID,
+                                                   ORIGIN_ID,
+                                                   V_ORIGIN_FROM,
+                                                   '000',
+                                                   V_SERV_ITEM_NAME, --ADDED ON 29-MAY-2015
+                                                   'Success');
+
+            END IF;
+
+   END IF;
+
+
+    idx := COLLECT_IN.next(idx);
+
+  end loop;
+
+-- CR 113 RM
+/* CR 113 */
+  BEGIN
+  SELECT TASK_ID INTO LATEST_TASK_ID
+  FROM CONNECT_TASK_DETAILS
+  WHERE ORIGIN_ID = V_ORIGIN_ID
+  AND TASK_DETAILS=ORDER_NUMBER_IN
+  AND CLIENT_ID =V_CLIENT_ID
+  AND STATUS_ID IN (13,17)
+  AND ROWNUM = 1
+  ORDER BY TASK_CREATE_DATE DESC;
+  EXCEPTION
+          WHEN OTHERS THEN
+          LATEST_TASK_ID := NULL;
+  END;
+  /* CR 113 */
+
+  DELETE FROM  CONNECT_COLLECT_TEMP CCT
+           WHERE CCT.order_number = ORDER_NUMBER_IN   --- Changed version 2.0
+             AND CCT.client_id = V_CLIENT_ID;
+
+   -------     Added on 28-FEB-2015 FOR CLOSING OPEN TASKS FOR WHICH COLLECTION DONE----
+   UPDATE CONNECT_TASK_DETAILS
+   SET STATUS_ID= (SELECT STATUS_ID FROM CONNECT_STATUS_MASTER WHERE STATUS_NAME='Accepted'),
+   TASK_UPDATE_DATE=SYSDATE ,
+   UPDATED_BY=USER_ID
+   WHERE TASK_DETAILS=ORDER_NUMBER_IN
+   AND CLIENT_ID =V_CLIENT_ID ;
+    ------
+
+END IF;
+
+--DBMS_OUTPUT.put_line('Total No of Parcels rejected '||V_ERR_COUNT);
+
+  IF (V_ERR_COUNT = 0 AND V_ORDER_CNT > 0 ) THEN
+
+  CONFIRMATION_MSG := 'Success';
+  preterr          := '000';
+
+  ELSIF (V_ERR_COUNT > 0 AND V_ERR_COUNT < V_TOTAL_PARCEL ) THEN
+
+  CONFIRMATION_MSG := 'Partial Error';
+  preterr          := '001';
+
+  ELSIF (V_ERR_COUNT > 0 AND V_ERR_COUNT = V_TOTAL_PARCEL) THEN
+
+  CONFIRMATION_MSG := 'Full Error';
+  preterr          := '111';
+
+  END IF;
+
+  /* CR 113 9-Nov-2015 */
+
+  V_ORIGIN_ID := ORIGIN_ID;
+
+  BEGIN
+  SELECT COUNT(1) INTO V_ACTIVE_TASK_CNT
+  FROM CONNECT_TASK_DETAILS
+  WHERE ORIGIN_ID = V_ORIGIN_ID
+  AND STATUS_ID = (SELECT CSM.STATUS_ID  FROM CONNECT_STATUS_MASTER CSM WHERE CSM.STATUS_NAME IN ('Created'));
+  EXCEPTION
+          WHEN OTHERS THEN
+          V_ACTIVE_TASK_CNT := NULL;
+  END;
+
+  BEGIN
+  SELECT COUNT(1) INTO V_ACK_TASK_CNT
+  FROM CONNECT_TASK_DETAILS
+  WHERE ORIGIN_ID = V_ORIGIN_ID
+  AND STATUS_ID = (SELECT CSM.STATUS_ID  FROM CONNECT_STATUS_MASTER CSM WHERE CSM.STATUS_NAME IN ('Acknowledged'));
+  EXCEPTION
+          WHEN OTHERS THEN
+          V_ACK_TASK_CNT := NULL;
+  END;
+
+
+
+   /* CR 113 9-Nov-2015 */
+
+  COMMIT;
+
+EXCEPTION
+
+  WHEN OTHERS THEN
+    preterr          := '633';--'500' Commented on 07-May-2015
+    CONFIRMATION_MSG := 'Store DB Internal Error';--'Internal Error' Commented on 07-May-2015
+    ROLLBACK;
+
+    V_MESSAGE := SUBSTR(SQLCODE || ':' || SQLERRM, 1, 4000);
+
+    INSERT INTO CONNECT_LOG
+      (PROCEDURE_NAME,
+       TABLE_NAME,
+       OPERATION_NAME,
+       RESPONSE_CODE,
+       MESSAGE,
+       OPERATION_DATE)
+    VALUES
+      (V_PROCEDURE_NAME,
+       V_TABLE_NAME,
+       V_OPERATION_NAME,
+       '633',--'500' Commented on 07-May-2015
+       V_MESSAGE,
+       SYSDATE);
+
+    COMMIT;
+
+END PR_COMPLETE_COLLECTION;
+
+
+PROCEDURE PR_MISSING_PRCL_COLLECTN
+                                  (  V_DESTINATION_ID      IN  VARCHAR2,
+                                     V_USER_ID             IN  VARCHAR2,
+                                     MODULE_NAME           IN  VARCHAR2,
+                                     MISSING_PRCL_IN       IN T_MISSING_PRCL_ARY,
+                                     MISSING_PRCL_OUT     OUT T_MISSING_PRCL_OUTARY,
+                                     FORWARD_OBJ          OUT OBJ_REMINDER_TBL,
+                                     CONFIRMATION_MSG     OUT VARCHAR2,
+                                     PRETERR              OUT VARCHAR2,
+                                     P_ID_FLAG           OUT VARCHAR2
+                                  ) IS
+  V_PROCEDURE_NAME VARCHAR2(30);
+  V_TABLE_NAME     VARCHAR2(30);
+  V_OPERATION_NAME VARCHAR2(100);
+  V_MESSAGE        VARCHAR2(1000);
+  V_PARCEL_NUMBER_OUT  VARCHAR2(100);
+  V_DO_NUMBER_OUT      VARCHAR2(100);
+  V_DESTINATION_ID_OUT VARCHAR2(100);
+  V_ASN_ID_OUT         VARCHAR2(100);
+  V_MISSING_REASON_CD  VARCHAR2(100);
+  V_PARCEL_CNT  NUMBER;
+  V_REFUNDABLE VARCHAR(1);
+  IDX  PLS_INTEGER;
+  V_SQL_MSG1 VARCHAR2(50):=' updated to MISSING in Collection';
+  V_SQL_MSG2 VARCHAR2(50):='Missing Reason Code';
+  V_SQL_MSG3 VARCHAR2(50):= 'Missing at Collection';
+  V_SQL_MSG3_1 VARCHAR2(50):= 'Missing at Store Return';
+  V_SQL_MSG4 VARCHAR2(50):= 'Update Missing in Collection';
+  V_SQL_MSG6 VARCHAR2(50):= 'Internal Error';
+  V_STATUS_NAME CONNECT_STATUS_MASTER.STATUS_NAME%TYPE;
+  TEMP_OBJECT OBJ_REMINDER_TEMP_TBL;
+  V_PARCEL_NUMBER CONNECT_PARCEL_LATEST_TRANS.PARCEL_NUMBER%TYPE;
+
+BEGIN
+
+  PRETERR          := NULL;
+  V_PROCEDURE_NAME := 'PR_MISSING_PRCL_COLLECTN';
+  CONFIRMATION_MSG := NULL;
+  MISSING_PRCL_OUT := T_MISSING_PRCL_OUTARY();
+  FORWARD_OBJ      :=OBJ_REMINDER_TBL();
+  TEMP_OBJECT:= OBJ_REMINDER_TEMP_TBL();
+
+
+     /* UPDATE CONNECT_PARCEL_LATEST_TRANS
+     TABLE FOR PARCEL TO BE COLLECTED WENT MISSING */
+
+  V_TABLE_NAME     := 'CONNECT_PARCEL_LATEST_TRANS';
+  V_OPERATION_NAME := 'UPDATE';
+
+  SELECT PARCEL_NO
+    INTO V_PARCEL_NUMBER
+    FROM TABLE(MISSING_PRCL_IN);
+
+    --dbms_output.put_line(V_PARCEL_NUMBER);
+
+  SELECT CSM.STATUS_NAME INTO V_STATUS_NAME
+    FROM CONNECT_STATUS_MASTER CSM,
+         CONNECT_PARCEL_LATEST_TRANS CPLT
+   WHERE CPLT.STATUS_ID=CSM.STATUS_ID
+     AND CPLT.PARCEL_NUMBER IN (V_PARCEL_NUMBER);
+
+   ---- Addition of  new logic to determine for drop off parcel to generate Post event or forward event based on Facility type--
+   /* SELECT ( CASE WHEN B.CONFIG_VALUE='Retain' THEN 'Y'
+			  WHEN B.CONFIG_VALUE='Return' THEN
+											   CASE WHEN C.CONFIG_VALUE IS NULL THEN 'N'
+											   ELSE C.CONFIG_VALUE END
+			  ELSE 'N' END ) INTO V_REFUNDABLE
+FROM CONNECT_FACILITY A,
+CONNECT_DATA_CONFIG B,
+CONNECT_DATA_CONFIG C
+WHERE A.FACILITY_ID= v_destination_id
+AND B.CONFIG_TYPE(+) = 'Routing for Drop off Center'
+AND A.FACILITY_TYPE = B.CONFIG_NAME(+)
+AND C.CONFIG_TYPE(+) = 'Refund eligibility flag'
+AND A.FACILITY_TYPE = C.CONFIG_NAME(+); */
+
+ SELECT ( CASE WHEN B.CONFIG_VALUE='Retain' THEN 'Y'
+			  WHEN B.CONFIG_VALUE='Return' THEN 'N' END )INTO V_REFUNDABLE
+FROM CONNECT_FACILITY A,
+CONNECT_DATA_CONFIG B,
+CONNECT_DATA_CONFIG C
+WHERE A.FACILITY_ID= v_destination_id
+AND B.CONFIG_TYPE= 'Routing for Drop off Center'
+AND A.FACILITY_TYPE = B.CONFIG_NAME
+AND C.CONFIG_TYPE(+) = 'Refund eligibility flag'
+AND A.FACILITY_TYPE = C.CONFIG_NAME;
+
+
+    --dbms_output.put_line(V_STATUS_NAME);
+
+ IF (MODULE_NAME = 'COLLECTION') THEN
+
+     V_OPERATION_NAME := 'COLLECTION';
+
+     BEGIN
+
+      SELECT CONFIG_VALUE
+        INTO V_MISSING_REASON_CD
+        FROM CONNECT_DATA_CONFIG
+       WHERE CONFIG_TYPE = V_SQL_MSG2
+         AND CONFIG_NAME = V_SQL_MSG3;
+
+         --dbms_output.put_line(V_MISSING_REASON_CD);
+
+    EXCEPTION
+    WHEN OTHERS THEN
+    V_MISSING_REASON_CD := NULL;
+
+    END;
+
+ ELSIF (MODULE_NAME = 'RETURN') THEN   -----
+
+        V_OPERATION_NAME := 'RETURN';
+
+        BEGIN
+
+       SELECT CONFIG_VALUE
+         INTO V_MISSING_REASON_CD
+         FROM CONNECT_DATA_CONFIG
+        WHERE CONFIG_TYPE = V_SQL_MSG2
+          AND CONFIG_NAME = V_SQL_MSG3_1;
+
+          --dbms_output.put_line(V_MISSING_REASON_CD);
+
+    EXCEPTION
+    WHEN OTHERS THEN
+    V_MISSING_REASON_CD := NULL;
+
+    END;
+
+ END IF;
+
+  IDX := MISSING_PRCL_IN.FIRST;
+
+  LOOP
+
+    EXIT WHEN IDX IS NULL;
+
+    SELECT COUNT(1)
+      INTO V_PARCEL_CNT
+      FROM CONNECT_PARCEL_LATEST_TRANS CPLT,
+           CONNECT_STATUS_MASTER CSM
+     WHERE CPLT.PARCEL_NUMBER = MISSING_PRCL_IN(idx).PARCEL_NO
+       AND CPLT.STATUS_ID = CSM.STATUS_ID
+       AND CSM.STATUS_NAME = 'Missing';
+
+IF (V_PARCEL_CNT = 0) THEN
+
+        UPDATE CONNECT_PARCEL_LATEST_TRANS CPLT
+           SET CPLT.STATUS_ID = CASE WHEN MODULE_NAME = 'RETURN' THEN CPLT.STATUS_ID ELSE	--CHANGED BY SOMRITA ON 12TH MARCH 2015
+                  (SELECT STATUS_ID
+                     FROM CONNECT_STATUS_MASTER CSM
+                    WHERE CSM.STATUS_NAME = 'Missing') END,
+               CPLT.REASON_CODE=V_MISSING_REASON_CD,
+               CPLT.STORE_RETURN_FLAG=NULL,					--CHANGED BY SOMRITA ON 12TH MARCH 2015
+               CPLT.UPDATED_BY = V_USER_ID,
+               CPLT.UPDATED_DATE = SYSDATE
+         WHERE CPLT.PARCEL_NUMBER = MISSING_PRCL_IN(idx).PARCEL_NO;
+
+         --dbms_output.put_line(SQL%ROWCOUNT);
+
+  IF (SQL%FOUND) AND V_STATUS_NAME NOT IN ('Retained','Dropoff')  THEN
+
+      SELECT B.PARCEL_NUMBER,
+             B.DO_NUMBER,
+             B.FINAL_DESTINATION_ID,
+             B.DELIVERY_NUMBER
+        INTO V_PARCEL_NUMBER_OUT  ,
+             V_DO_NUMBER_OUT      ,
+             V_DESTINATION_ID_OUT ,
+             V_ASN_ID_OUT
+        FROM CONNECT_PARCEL_STATE B
+       WHERE B.PARCEL_NUMBER = MISSING_PRCL_IN(idx).PARCEL_NO;				--ADDED BY SOMRITA ON 12TH MARCH 2015
+        P_ID_FLAG:='POST';
+       MISSING_PRCL_OUT.EXTEND;
+      MISSING_PRCL_OUT(idx) := T_MISSING_PRCL_OUT('Post Event',
+                                                      'Missing',
+                                           V_PARCEL_NUMBER_OUT  ,
+                                           V_DO_NUMBER_OUT      ,
+                                           V_DESTINATION_ID_OUT ,
+                                           V_ASN_ID_OUT,
+                                           V_MISSING_REASON_CD,
+                                           'Success',
+                                           '000'
+                                           );
+
+
+                    INSERT INTO CONNECT_USER_AUDIT
+                                (
+                                  USER_ID,
+                                  PACKAGE_NUMBER,
+                                  PACKAGE_TYPE,
+                                  STORE_NUMBER,
+                                  ACTION_TYPE,
+                                  MESSAGE,
+                                  AUDIT_CREATE_DATE
+                                )
+                        VALUES
+                              (
+                                V_USER_ID,
+                                 MISSING_PRCL_IN(idx).PARCEL_NO,
+                                'PARCEL',
+                                V_DESTINATION_ID,
+                                V_SQL_MSG4,
+                                 'Parcel number: '|| MISSING_PRCL_IN(idx).PARCEL_NO||V_SQL_MSG1,
+                                SYSDATE
+                              );
+ELSE
+--end if;
+
+
+ IF  V_STATUS_NAME  IN ('Dropoff') and v_refundable='Y' THEN
+
+                          SELECT OBJ_REMINDER_TEMP
+                                        (
+                                          PARCEL_NUMBER,
+                                          FACILITY_NAME,
+                                          ORDER_CREATED_DATE,
+                                          DWELL_TIME,
+                                          DWELL_TIME_UPDATE_FLAG,
+                                          FINAL_DESTINATION_ID,
+                                          FINAL_DESTINATION_TYPE,
+                                          ORDER_NUMBER,
+                                          CLIENT_ID,
+                                          ORDER_TYPE,
+                                          CUSTOMER_FIRST_NAME,
+                                          CUSTOMER_SURNAME,
+                                          CUSTOMER_EMAILID,
+                                          CONTACT_NUMBER
+                                         )
+                          BULK COLLECT INTO TEMP_OBJECT
+                          FROM (
+                                   SELECT A.PARCEL_NUMBER,
+                                          NVL(C.FACILITY_NAME,'Default') AS FACILITY_NAME,
+                                          B.ORDER_CREATED_DATE,
+                                          A.DWELL_TIME,
+                                          A.DWELL_TIME_UPDATE_FLAG,
+                                          C.FINAL_DESTINATION_ID,
+                                          C.FINAL_DESTINATION_TYPE,
+                                          C.ORDER_NUMBER,
+                                          C.CLIENT_ID,
+                                          B.ORDER_TYPE,
+                                          --'A2CRTN' ORDER_TYPE,
+                                          B.CUSTOMER_FIRST_NAME,
+                                          B.CUSTOMER_SURNAME,
+                                          B.CUSTOMER_EMAILID,
+                                          B.CONTACT_NUMBER
+                                    FROM CONNECT_PARCEL_LATEST_TRANS A,
+                                         CONNECT_CUSTOMER_TRANS B,
+                                         CONNECT_PARCEL_STATE C
+                                    WHERE A.PARCEL_NUMBER=C.PARCEL_NUMBER(+)
+                                     AND B.ORDER_NUMBER(+)   =C.ORDER_NUMBER
+                                     AND B.CLIENT_ID (+)     =C.CLIENT_ID
+                                     AND A.PARCEL_NUMBER  IN V_PARCEL_NUMBER
+                                );
+
+                       FOR K IN 1..TEMP_OBJECT.COUNT LOOP
+
+                        FORWARD_OBJ.EXTEND;
+                        FORWARD_OBJ(1) := OBJ_REMINDER(
+                                                                   SYSDATE,
+                                                                   NULL,
+                                                                   '903 - Missing',
+                                                                   '903 - Missing',
+                                                                   'LPN',
+                                                                   TEMP_OBJECT(K).PARCEL_NUMBER,
+                                                                   TEMP_OBJECT(K).FINAL_DESTINATION_ID,
+                                                                   'NA',
+                                                                   TEMP_OBJECT(K).FINAL_DESTINATION_TYPE,
+                                                                   TEMP_OBJECT(K).PARCEL_NUMBER,
+                                                                   NVL(TEMP_OBJECT(K).ORDER_NUMBER,TEMP_OBJECT(K).PARCEL_NUMBER),
+                                                                   TEMP_OBJECT(K).CLIENT_ID,
+                                                                   'NA',
+                                                                   TEMP_OBJECT(K).ORDER_TYPE,
+                                                                   --'A2CRTN', -- 8th Feb 2016 :- Hard coded as  A2CRTN for Drop off parcels considering it will be always A2C
+                                                                   TEMP_OBJECT(K).CUSTOMER_FIRST_NAME,
+                                                                   TEMP_OBJECT(K).CUSTOMER_SURNAME,
+                                                                   TEMP_OBJECT(K).CUSTOMER_EMAILID,
+                                                                   TEMP_OBJECT(K).CONTACT_NUMBER,
+                                                                   NULL,
+                                                                   NULL,
+                                                                   TO_CHAR(TEMP_OBJECT(K).ORDER_CREATED_DATE,'mm/dd/yy hh24:mi:ss'),
+                                                                   'false',
+                                                                   'false',
+                                                                   NULL
+                                                                 );
+
+                              END LOOP;
+
+                              P_ID_FLAG:='FORWARD';
+
+							  END IF;
+
+                               IF  V_STATUS_NAME  IN ('Dropoff') and v_refundable='N' THEN
+                               ---Generate  post  event for-drop-off-and-return-parcels
+
+                               SELECT B.PARCEL_NUMBER,
+             B.DO_NUMBER,
+             B.FINAL_DESTINATION_ID,
+             B.DELIVERY_NUMBER
+        INTO V_PARCEL_NUMBER_OUT  ,
+             V_DO_NUMBER_OUT      ,
+             V_DESTINATION_ID_OUT ,
+             V_ASN_ID_OUT
+        FROM CONNECT_PARCEL_STATE B
+       WHERE B.PARCEL_NUMBER = MISSING_PRCL_IN(idx).PARCEL_NO;				--ADDED BY SOMRITA ON 12TH MARCH 2015
+        P_ID_FLAG:='POST';
+       MISSING_PRCL_OUT.EXTEND;
+      MISSING_PRCL_OUT(idx) := T_MISSING_PRCL_OUT('Post Event',
+                                                      'Missing',
+                                           V_PARCEL_NUMBER_OUT  ,
+                                           V_DO_NUMBER_OUT      ,
+                                           V_DESTINATION_ID_OUT ,
+                                           V_ASN_ID_OUT,
+                                           V_MISSING_REASON_CD,
+                                           'Success',
+                                           '000'
+                                           );
+
+
+                    INSERT INTO CONNECT_USER_AUDIT
+                                (
+                                  USER_ID,
+                                  PACKAGE_NUMBER,
+                                  PACKAGE_TYPE,
+                                  STORE_NUMBER,
+                                  ACTION_TYPE,
+                                  MESSAGE,
+                                  AUDIT_CREATE_DATE
+                                )
+                        VALUES
+                              (
+                                V_USER_ID,
+                                 MISSING_PRCL_IN(idx).PARCEL_NO,
+                                'PARCEL',
+                                V_DESTINATION_ID,
+                                V_SQL_MSG4,
+                                 'Parcel number: '|| MISSING_PRCL_IN(idx).PARCEL_NO||V_SQL_MSG1,
+                                SYSDATE
+                              );
+
+                               END IF;
+
+ END IF;
+
+ END IF;
+  idx := MISSING_PRCL_IN.next(idx);
+
+  end loop;
+
+  CONFIRMATION_MSG := 'Success';
+  preterr          := '000';
+
+   COMMIT;
+
+EXCEPTION
+
+  WHEN OTHERS THEN
+    preterr          := 'Store DB Internal Error';--V_SQL_MSG6 Commented on 07-May-2015
+    CONFIRMATION_MSG := '633';--'500' Commented on 07-May-2015
+    ROLLBACK;
+
+    V_MESSAGE := SUBSTR(SQLCODE || ':' || SQLERRM, 1, 1000);
+
+    INSERT INTO CONNECT_LOG
+      (PROCEDURE_NAME,
+       TABLE_NAME,
+       OPERATION_NAME,
+       RESPONSE_CODE,
+       MESSAGE,
+       OPERATION_DATE)
+    VALUES
+      (V_PROCEDURE_NAME,
+       V_TABLE_NAME,
+       V_OPERATION_NAME,
+       CONFIRMATION_MSG,
+       V_MESSAGE,
+       SYSDATE);
+
+    COMMIT;
+
+END PR_MISSING_PRCL_COLLECTN;
+
+
+END PKG_PARCEL_COLLECTION;

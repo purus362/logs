@@ -1,0 +1,1574 @@
+CREATE OR REPLACE PACKAGE AUTOCORR."AUTO_CORRECT_PKG" IS
+/***********************************************************************************************************
+Package    : AUTO_CORRECT_PKG
+Purpose    : Correction automation of PMM errors
+Author     : Bill Oosse
+Date       : 07/17/2015
+'**********************************************************************************************************
+Modification History:
+Wrk/Inc#         Date        Who         Comment
+WRK000000071607  07/17/2015  Bill Oosse  Initial Development
+WRK000000071607  01/15/2016  Bill Oosse  2nd Install - add procs TRFRECON_VARWGT, INVRECON_RSVD, and
+                                         PMGSTR_REJ175
+'**********************************************************************************************************/
+  PROCEDURE TRFIMP_CORRECT (
+    p_ctrl_id       IN aut_crr_ctrl.ctrl_id%TYPE );
+
+  PROCEDURE TRFIMP_UPD_RCPT (
+    p_session       IN sditrfdti.session_number%TYPE,
+    p_action_code   IN sditrfdti.action_code%TYPE,
+    p_cnt           OUT int );
+
+  PROCEDURE INVREJ_DELETE (
+    p_ctrl_id       IN aut_crr_ctrl.ctrl_id%TYPE );
+
+  PROCEDURE TRFRECON_VARWGT (
+    p_ctrl_id       IN aut_crr_ctrl.ctrl_id%TYPE );
+
+  PROCEDURE INVRECON_RSVD (
+    p_ctrl_id       IN aut_crr_ctrl.ctrl_id%TYPE );
+
+  PROCEDURE INVUNAVAIL_WGT (
+    p_ctrl_id       IN aut_crr_ctrl.ctrl_id%TYPE );
+
+  PROCEDURE PMGSTR_REJ175 (
+    p_ctrl_id       IN aut_crr_ctrl.ctrl_id%TYPE );
+
+  PROCEDURE TRFIMP_NOTIFY_REJ (
+    p_proc_name     IN CHAR,
+    p_session       IN sditrfdti.session_number%TYPE );
+
+  PROCEDURE INVIMP_NOTIFY_REJ (
+    p_proc_name     IN CHAR,
+    p_session       IN invrejee.trans_session%TYPE );
+
+END AUTO_CORRECT_PKG;
+-----------
+CREATE OR REPLACE PACKAGE BODY AUTOCORR."AUTO_CORRECT_PKG"
+IS
+
+g_ctrl_id  aut_crr_ctrl.ctrl_id%TYPE;
+g_ctrl_dsc aut_crr_ctrl.ctrl_dsc%TYPE;
+
+PROCEDURE TRFIMP_CORRECT ( p_ctrl_id IN aut_crr_ctrl.ctrl_id%TYPE )
+IS
+
+  proc_abort    EXCEPTION;
+  v_proc_name    CHAR(15) := 'TRFIMP_CORRECT';
+  v_error_text   VARCHAR(256);
+  v_trans_feed     invtrhee.trans_feed%TYPE := -5;
+  v_trans_feed_old invtrhee.trans_feed%TYPE := -10;
+  v_action_code  sditrfdti.action_code%TYPE;
+  v_lmt_dsc      VARCHAR(7);
+  v_session_lmt  INT;
+  v_lmt          INT;
+  v_session_cnt  INT;
+  v_cnt          INT;
+  v_max_tech_key sditrfdti.tech_key%TYPE;
+  v_min_sess     sditrfdti.session_number%TYPE;
+  v_date_created DATE;
+  v_inv_sess     invtrhee.trans_session%TYPE;
+
+
+BEGIN
+  v_error_text := 'SUCCESSFUL';
+
+  BEGIN
+
+  SELECT CTL.ctrl_id
+        ,MIN(CTL.action_code)
+        ,MIN(CTL.ctrl_dsc)
+        ,MAX(decode(trim(ctrl_parm_ct), 'SESSIONS', ctrl_parm_cnt)) session_cnt
+        ,MAX(decode(trim(ctrl_parm_ct), 'ROWS',     ctrl_parm_cnt)) row_cnt
+  INTO g_ctrl_id, v_action_code, g_ctrl_dsc, v_session_lmt, v_lmt
+  FROM aut_crr_ctrl CTL
+      ,aut_crr_ctrl_parm PRM
+  WHERE CTL.ctrl_id = p_ctrl_id
+  AND   PRM.ctrl_id = CTL.ctrl_id
+  GROUP BY CTL.ctrl_id;
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_error_text := 'EMAIL: No rows found on aut_crr_ctrl and/or aut_crr_ctrl_parm table for ctrl_id = ' || p_ctrl_id;
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (p_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END;
+
+  IF g_ctrl_id = 'TRFSHP' THEN -- Transfer Shipment
+      SELECT COUNT(distinct A.SESSION_NUMBER)
+            ,COUNT(*)
+            ,MIN(A.session_number)
+            ,MIN(A.Date_Created)
+            ,MAX(tech_key)
+      INTO v_session_cnt, v_cnt, v_min_sess, v_date_created, v_max_tech_key
+      FROM  SDITRFDTI A
+      WHERE error_code  IN (207,651)
+      AND   action_code = v_action_code
+      AND   NOT EXISTS (SELECT 1 FROM sditrfdti C
+                        WHERE C.error_code IS NULL
+                        AND C.action_code = v_action_code
+                        AND C.Session_Number = A.Session_Number);
+
+  ELSIF g_ctrl_id = 'TRFRCT' THEN -- Transfer Receipt
+      SELECT COUNT(distinct A.SESSION_NUMBER)
+            ,COUNT(*)
+            ,MIN(A.session_number)
+            ,MIN(A.Date_Created)
+            ,MAX(tech_key)
+      INTO v_session_cnt, v_cnt, v_min_sess, v_date_created, v_max_tech_key
+      FROM  SDITRFDTI A
+      WHERE error_code  IN (1,12)
+      AND   action_code = v_action_code
+      AND   NOT EXISTS (SELECT 1 FROM sditrfdti C
+                        WHERE C.error_code IS NULL
+                        AND C.action_code = v_action_code
+                        AND C.Session_Number = A.Session_Number);
+  ELSE
+      v_error_text := 'EMAIL: Invalid ctrl_id passed to ' ||
+                      trim(v_proc_name) || ', ctrl_id = ' || g_ctrl_id;
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END IF;
+
+  IF v_cnt = 0 THEN
+      v_error_text := TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) ||
+                  ', ' || g_ctrl_dsc || ' - no rejects to correct. exit.';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      RAISE proc_abort ;
+  END IF;
+
+  IF   v_session_cnt > v_session_lmt
+    OR v_cnt         > v_lmt THEN
+      IF v_session_cnt > v_session_lmt THEN
+          v_lmt_dsc := 'SESSION';
+          v_cnt     := v_session_cnt;
+          v_lmt     := v_session_lmt;
+      ELSE
+          v_lmt_dsc := 'ROW';
+      END IF;
+      v_error_text := 'EMAIL: '  || trim(v_proc_name) || ', ' || g_ctrl_dsc || ', ' ||
+                  v_lmt_dsc || ' limit exceeded - nothing processed. Count = ' ||
+                  to_char(v_cnt) || ', Limit = ' || to_char(v_lmt);
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+      RAISE proc_abort ;
+  END IF;
+
+
+  IF g_ctrl_id = 'TRFSHP' THEN -- Transfer Shipment
+      UPDATE sditrfdti A
+      SET session_number  = v_min_sess
+         ,tech_key        = v_max_tech_key + 7000 + rownum
+         ,trf_reason_code = '89'
+         ,trf_number      = CASE WHEN error_code = 207 THEN NULL ELSE trf_number END
+         ,jda_origin      = CASE WHEN error_code = 207 THEN 'F'  ELSE jda_origin END
+         ,pmg_po_number   = CASE WHEN error_code = 651 THEN NULL ELSE pmg_po_number END
+         ,error_code      = NULL
+         ,download_date_1 = NULL
+      WHERE action_code = v_action_code
+      AND   ERROR_CODE IN (207,651)
+      AND   NOT EXISTS (SELECT 1 FROM sditrfdti B
+                        WHERE B.Error_Code IS NULL
+                        AND   B.action_code = v_action_code
+                        AND   B.session_number = A.session_number);
+      COMMIT;
+
+  ELSE -- g_ctrl_id = 'TRFRCT' -- Transfer Receipt
+      UPDATE sditrfdti A
+      SET session_number  = v_min_sess
+         ,tech_key        = v_max_tech_key + 6000 + rownum
+      WHERE action_code = v_action_code
+      AND   error_code IN (1,12)
+      AND   NOT EXISTS (SELECT 1 FROM sditrfdti B
+                        WHERE B.Error_Code IS NULL
+                        AND   B.action_code = v_action_code
+                        AND   B.session_number = A.session_number);
+      COMMIT;
+      TRFIMP_UPD_RCPT ( v_min_sess, v_action_code, v_cnt );
+      IF v_cnt = 0 THEN
+          TRFIMP_NOTIFY_REJ (v_proc_name, v_min_sess);
+          RAISE proc_abort;
+      END IF;
+      COMMIT;
+  END IF;
+
+  -- Before calling trfdtlim with v_trans_feed, update any leftover uncompleted inventory sessions
+  -- to v_trans_feed_old
+  UPDATE invtrhee SET trans_feed = v_trans_feed_old
+  WHERE trans_feed = v_trans_feed;
+  COMMIT;
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute trfdtlim, session_number = ' || to_char(v_min_sess) );
+
+  v_proc_name := 'TRFDTLIM';
+  trfdtlim (v_min_sess, 'A', v_trans_feed, NULL);
+  v_proc_name := 'TRFIMP_CORRECT';
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute trfdtlim complete' );
+
+  INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+              values (g_ctrl_id, systimestamp, v_cnt
+                     ,'trfdtlim executed, session was: ' || to_char(v_min_sess) );
+
+  TRFIMP_NOTIFY_REJ (v_proc_name, v_min_sess);
+
+  -----------------------
+  -- Process inventory
+  -----------------------
+  BEGIN
+    SELECT trans_session
+    INTO v_inv_sess
+    FROM invtrhee
+    WHERE trans_feed = v_trans_feed
+    AND rownum = 1;
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        v_error_text := 'EMAIL: ' || trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                    ', No rows on invtrhee, exit.';
+        dbms_output.put_line ( v_error_text );
+        INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                    values (g_ctrl_id, systimestamp, 0, v_error_text);
+        RAISE proc_abort;
+  END;
+
+  UPDATE invtrnee
+  SET trans_ref2 = to_char(v_date_created,'YYYYMMDDHH24MISS')
+  WHERE trans_session = v_inv_sess;
+
+  v_cnt := SQL%ROWCOUNT;
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute invtrnprc, trans_session = ' || to_char(v_inv_sess) );
+
+  v_proc_name := 'INVTRNPRC';
+  invtrnprc (v_inv_sess);
+  v_proc_name := 'TRFIMP_CORRECT';
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute invtrnprc complete' );
+
+  INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+              values (g_ctrl_id, systimestamp, v_cnt
+                     ,'invtrnprc executed, trans_session = ' || to_char(v_inv_sess) );
+
+  INVIMP_NOTIFY_REJ (v_proc_name, v_inv_sess);
+
+EXCEPTION
+
+    WHEN proc_abort THEN
+      COMMIT;
+      RETURN;
+
+    WHEN OTHERS THEN
+        v_error_text := 'EMAIL: Proc failed: ' || trim(v_proc_name) || ': ' || SUBSTR(SQLERRM, 1, 210);
+        DBMS_OUTPUT.PUT_LINE ( v_error_text );
+        INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_dsc)
+                    values (g_ctrl_id, systimestamp, v_error_text);
+        COMMIT;
+        RETURN;
+
+END TRFIMP_CORRECT;
+
+
+PROCEDURE TRFIMP_UPD_RCPT (
+    p_session       IN sditrfdti.session_number%TYPE,
+    p_action_code   IN sditrfdti.action_code%TYPE,
+    p_cnt           OUT int)
+IS
+
+  v_proc_name   CHAR(15) := 'TRFIMP_UPD_RCPT';
+  v_trf_number  sditrfdti.trf_number%TYPE;
+  v_err_logged  CHAR(1)  := 'N';
+  v_error_text  VARCHAR(256);
+
+
+  CURSOR MANIFEST_CONTROL_CURSOR  IS
+      SELECT session_number
+            ,tech_key
+            ,trf_number
+            ,mnfst_number
+      FROM sditrfdti
+      WHERE session_number = p_session
+      AND   action_code    = p_action_code
+      AND   error_code IN (1,12);
+
+BEGIN
+
+  p_cnt := 0;
+
+  FOR MCC_Rec IN MANIFEST_CONTROL_CURSOR
+  LOOP
+
+      BEGIN
+          SELECT B.trf_number
+          INTO  v_trf_number
+          FROM  trfmfhee A , trfmfpee B
+          WHERE A.trf_manifest_id = MCC_Rec.mnfst_number
+          AND   A.trf_manifest_sts = 4
+          AND   A.trf_manifest_key = B.trf_manifest_key
+          AND   rownum = 1;
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+          NULL;
+      END;
+
+      IF SQL%ROWCOUNT > 0 THEN
+
+          p_cnt := p_cnt + 1;
+
+          UPDATE sditrfdti
+          SET trf_number      = v_trf_number
+             ,error_code      = NULL
+             ,download_date_1 = NULL
+             ,pmg_po_number   = NULL
+             ,trf_reason_code = NVL2(MCC_Rec.Trf_Number,trf_reason_code,N'91')
+          WHERE session_number = MCC_Rec.Session_Number
+          AND   tech_key       = MCC_Rec.tech_key;
+
+      ELSIF v_err_logged = 'N' THEN
+
+          v_error_text := trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', Cannot find Transfer Number for Manifest Number, Session_number = ' || to_char(p_session);
+          DBMS_OUTPUT.PUT_LINE ( v_error_text );
+          INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_dsc)
+                      values (g_ctrl_id, systimestamp, v_error_text);
+          v_err_logged := 'Y';
+
+      END IF;
+
+  END LOOP;
+
+END TRFIMP_UPD_RCPT;
+
+
+PROCEDURE INVREJ_DELETE ( p_ctrl_id IN aut_crr_ctrl.ctrl_id%TYPE )
+IS
+
+  proc_abort    EXCEPTION;
+  v_proc_name   CHAR(15) := 'INVREJ_DELETE';
+  v_error_code  INTEGER;
+  v_error_text  VARCHAR(256);
+  v_lmt         INT;
+  v_cnt         INT;
+
+
+BEGIN
+  v_error_code := 0;
+  v_error_text := 'SUCCESSFUL';
+
+  BEGIN
+
+    SELECT PRM.ctrl_id, PRM.ctrl_parm_cnt, CTL.ctrl_dsc
+    INTO g_ctrl_id, v_lmt, g_ctrl_dsc
+    FROM aut_crr_ctrl CTL
+        ,aut_crr_ctrl_parm PRM
+    WHERE CTL.ctrl_id = p_ctrl_id
+    AND   PRM.ctrl_id = CTL.CTRL_ID
+    AND   PRM.ctrl_parm_ct = 'ROWS';
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_error_text := 'EMAIL: No row found on aut_crr_ctrl and/or aut_crr_ctrl_parm table for ctrl_id = ' || p_ctrl_id;
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (p_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END;
+
+  IF g_ctrl_id IN ('INVRD22','INVRD548','INVRD0QW') THEN
+      NULL;
+  ELSE
+      v_error_text := 'EMAIL: Invalid ctrl_id passed to ' ||
+                      trim(v_proc_name) || ', ctrl_id = ' || g_ctrl_id;
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+  END IF;
+
+
+  IF g_ctrl_id = 'INVRD22' THEN    -- Invalid Product
+      SELECT count(*) INTO v_cnt FROM INVREJEE WHERE ERROR_CODE = 22;
+  ELSIF g_ctrl_id = 'INVRD548' THEN -- Invalid Location Org 547,548
+      SELECT count(*) INTO v_cnt FROM INVREJEE WHERE trans_org_lvl_number IN (547, 548);
+  ELSE -- g_ctrl_id = 'INVRD0QW'  0 Quantity/Weight
+      SELECT count(*) INTO v_cnt FROM INVREJEE WHERE trans_qty = 0 AND trans_weight = 0 AND trans_inners = 0;
+  END IF;
+
+
+  IF v_cnt > v_lmt THEN
+      v_error_text := 'EMAIL: '  || trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', ROW limit exceeded - nothing deleted. Count = ' || to_char(v_cnt) ||
+                  ', Limit = ' || to_char(v_lmt);
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+      RAISE proc_abort ;
+  END IF;
+
+
+  IF v_cnt > 0 THEN
+      IF g_ctrl_id = 'INVRD22' THEN    -- Invalid Product
+          DELETE FROM INVREJEE WHERE ERROR_CODE = 22;
+          v_cnt := SQL%ROWCOUNT;
+      ELSIF g_ctrl_id = 'INVRD548' THEN -- Invalid Location Org 547,548
+          DELETE FROM INVREJEE WHERE trans_org_lvl_number IN (547, 548);
+          v_cnt := SQL%ROWCOUNT;
+      ELSE -- g_ctrl_id = 'INVRD0QW'  0 Quantity/Weight
+          DELETE FROM INVREJEE WHERE trans_qty = 0 AND trans_weight = 0 AND trans_inners = 0;
+          v_cnt := SQL%ROWCOUNT;
+      END IF;
+  END IF;
+
+  v_error_text := trim(v_proc_name) || ', ' || g_ctrl_dsc || ', INVREJEE rows deleted = ' || to_char(v_cnt);
+  DBMS_OUTPUT.PUT_LINE ( v_error_text );
+  -- insert log row if any rows deleted
+  IF v_cnt > 0 THEN
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+  END IF;
+
+  COMMIT;
+
+EXCEPTION
+
+    WHEN proc_abort THEN
+      COMMIT;
+      RETURN;
+
+    WHEN OTHERS THEN
+        v_error_code := SQLCODE;
+        v_error_text := SQLERRM;
+        DBMS_OUTPUT.PUT_LINE ( 'SQLCODE = ' || to_char(v_error_code) );
+        DBMS_OUTPUT.PUT_LINE ( v_error_text );
+        COMMIT;
+        RETURN;
+
+END INVREJ_DELETE;
+
+PROCEDURE TRFRECON_VARWGT ( p_ctrl_id IN aut_crr_ctrl.ctrl_id%TYPE )
+  -- has batch parm - but no limit parm
+IS
+
+  proc_abort    EXCEPTION;
+  v_proc_name    CHAR(15) := 'TRFRECON_VARWGT';
+  v_error_text   VARCHAR(256);
+  v_trans_feed     invtrhee.trans_feed%TYPE := -5;
+  v_trans_feed_old invtrhee.trans_feed%TYPE := -10;
+  v_batch_cnt    INT;
+  v_tech_key     sditrfdti.tech_key%TYPE;
+  v_session      sditrfdti.session_number%TYPE;
+  v_inv_sess     invtrhee.trans_session%TYPE;
+  v_cnt          INT;
+  v_proc_flg     boolean := FALSE;
+  v_inv_flg      boolean;
+
+
+  CURSOR CSR_TRFHDR IS
+    SELECT H.trf_number, O.org_lvl_number, H.trf_type_id, H.trf_prior_id
+    FROM trfhdree H, orgmstee O
+    WHERE O.org_lvl_child = H.trf_ship_loc
+    AND   O.org_lvl_number IN (SELECT ctrl_parm_cnt FROM aut_crr_ctrl_parm
+                               WHERE ctrl_id = p_ctrl_id
+                               AND   ctrl_parm_ct LIKE 'ORG%')
+    AND   H.trf_status = 7
+    AND   H.trf_entry_date < TRUNC(SYSDATE) - 3
+    ORDER BY 1 ;
+
+  CURSOR CSR_Sessions IS
+    SELECT DISTINCT session_number
+    FROM sditrfdti
+    WHERE reference = 'TRFRECON'
+    AND   error_code IS NULL;
+
+BEGIN
+  v_error_text := 'SUCCESSFUL';
+
+  BEGIN
+
+    SELECT CTL.ctrl_id
+          ,CTL.ctrl_dsc
+          ,PRM.ctrl_parm_cnt
+    INTO g_ctrl_id, g_ctrl_dsc, v_batch_cnt
+    FROM aut_crr_ctrl CTL
+        ,aut_crr_ctrl_parm PRM
+    WHERE CTL.ctrl_id = p_ctrl_id
+    AND   PRM.ctrl_id = CTL.ctrl_id
+    AND   PRM.ctrl_parm_ct = 'BATCH';
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_error_text := 'EMAIL: No rows found on aut_crr_ctrl and/or aut_crr_ctrl_parm table for ctrl_id = ' || p_ctrl_id
+                      || ' and ctrl_parm_ct = ' || 'BATCH';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (p_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END;
+
+  v_cnt := v_batch_cnt + 1;
+
+  FOR TRFHDR_Rec IN CSR_TRFHDR
+  LOOP
+
+      IF v_cnt >= v_batch_cnt THEN
+          bastkey('trans_session', 0, v_session);
+          v_tech_key := 8000;
+          v_cnt      := 0;
+      END IF;
+
+      INSERT INTO sditrfdti (
+                 session_number
+                ,tech_key
+                ,trf_number
+                ,carrier_name
+                ,prd_lvl_number
+                ,jda_origin
+                ,trf_type_code
+                ,trf_reason_code
+                ,from_loc
+                ,to_loc
+                ,quantity
+                ,action_code
+                ,receipt_date
+                ,reference
+                ,date_created
+                ,prd_upc
+                ,cross_dock_loc
+                ,inner_pack_id
+                ,trf_ipid_conv
+                ,trf_qty_flag
+                ,trf_weight_uom
+                ,trf_weight
+                ,mir_ship_ext_cost
+                ,mir_rec_ext_cost)
+          SELECT v_session
+                ,v_tech_key + rownum
+                ,TRFHDR_Rec.trf_number
+                ,'Meijer'
+                ,PM.prd_lvl_number
+                ,'T'
+                ,TRFHDR_Rec.trf_type_id
+                ,TRFHDR_Rec.trf_prior_id
+                ,TRFHDR_Rec.org_lvl_number -- ship loc
+                ,OM.org_lvl_number         -- recv loc
+                ,0                         -- quantity
+                ,'05'
+                ,TRUNC(SYSDATE)
+                ,'TRFRECON'
+                ,SYSDATE
+                ,0
+                ,0
+                ,PP.inner_pack_id
+                ,TD.trf_ipid_conv
+                ,'P'
+                ,'LB'
+                ,TD.trf_qty_pick - NVL(TD.trf_in_manifest,0)
+                ,0
+                ,0
+          FROM trfdtlee TD, prdpcdee PP, prdmstee PM, orgmstee OM
+          WHERE TD.Trf_Number = TRFHDR_Rec.trf_number
+          AND   TD.trf_status in (3,7)
+          AND   TD.trf_qty_alloc > 0
+          AND   TD.prd_lvl_master = 0
+          AND   TD.prd_lvl_child = PM.prd_lvl_child
+          AND   TD.trf_rec_loc = OM.org_lvl_child
+          AND   TD.inner_pk_tech_key = PP.inner_pk_tech_key
+          AND   TD.qty_pick_inners = NVL(TD.in_manifest_inners,0)
+          AND   PM.var_weight_item = 'T'
+          AND   TD.trf_rec_loc = OM.org_lvl_child
+          AND NOT EXISTS
+             (SELECT 1 FROM trfmfpee
+              WHERE trf_number = TD.trf_number
+              AND   prd_lvl_child = TD.prd_lvl_child
+              AND   trf_manifest_sts = 4)
+          ;
+
+      v_cnt := v_cnt + SQL%ROWCOUNT;
+      IF v_cnt > 0 THEN
+          v_proc_flg := TRUE;
+          v_tech_key := 8000 + v_cnt;
+      END IF;
+
+  END LOOP;
+
+  -- If nothing to process, abort.
+  IF NOT v_proc_flg THEN
+      v_error_text := TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) ||
+                  ', ' || g_ctrl_dsc || ' - nothing to process. exit.';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      RAISE proc_abort ;
+  END IF;
+
+  -- Before calling trfdtlim with v_trans_feed, update any leftover uncompleted inventory sessions
+  -- to v_trans_feed_old
+  UPDATE invtrhee SET trans_feed = v_trans_feed_old
+  WHERE trans_feed = v_trans_feed;
+
+  COMMIT;
+
+  FOR C_sess IN CSR_Sessions
+  LOOP
+
+    SELECT count(*)
+    INTO v_cnt
+    FROM sditrfdti
+    WHERE session_number = C_sess.session_number;
+
+
+    dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                          g_ctrl_dsc || ', Execute trfdtlim, session_number = ' || to_char(C_sess.session_number) );
+
+    v_proc_name := 'TRFDTLIM';
+    trfdtlim (C_sess.session_number, 'A', v_trans_feed, NULL);
+    v_proc_name := 'TRFRECON_VARWGT';
+
+    dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                          g_ctrl_dsc || ', Execute trfdtlim complete' );
+
+    INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                values (g_ctrl_id, systimestamp, v_cnt
+                       ,'trfdtlim executed, session was: ' || to_char(C_sess.session_number) );
+
+    TRFIMP_NOTIFY_REJ (v_proc_name, C_sess.session_number);
+
+    -----------------------
+    -- Process inventory
+    -----------------------
+    BEGIN
+      v_inv_flg := TRUE;
+
+      SELECT trans_session
+      INTO v_inv_sess
+      FROM invtrhee
+      WHERE trans_feed = v_trans_feed
+      AND rownum = 1;
+
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+          v_error_text := 'EMAIL: ' || trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                      ', No rows on invtrhee for sditrfdti session ' || to_char(C_sess.session_number) || ', exit.';
+          dbms_output.put_line ( v_error_text );
+          INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                      values (g_ctrl_id, systimestamp, 0, v_error_text);
+          v_inv_flg := FALSE;
+    END;
+
+    IF v_inv_flg THEN
+
+      UPDATE invtrnee
+      SET trans_ref2 = to_char(SYSDATE,'YYYYMMDDHH24MISS')
+      WHERE trans_session = v_inv_sess;
+
+      v_cnt := SQL%ROWCOUNT;
+
+      dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                            g_ctrl_dsc || ', Execute invtrnprc, trans_session = ' || to_char(v_inv_sess) );
+
+      v_proc_name := 'INVTRNPRC';
+      invtrnprc (v_inv_sess);
+      v_proc_name := 'TRFRECON_VARWGT';
+
+      dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                            g_ctrl_dsc || ', Execute invtrnprc complete' );
+
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt
+                         ,'invtrnprc executed, trans_session = ' || to_char(v_inv_sess) );
+
+      INVIMP_NOTIFY_REJ (v_proc_name, v_inv_sess);
+
+    END IF;
+
+  END LOOP;
+
+
+EXCEPTION
+
+    WHEN proc_abort THEN
+      COMMIT;
+      RETURN;
+
+    WHEN OTHERS THEN
+        v_error_text := 'EMAIL: Proc failed: ' || trim(v_proc_name) || ': ' || SUBSTR(SQLERRM, 1, 210);
+        DBMS_OUTPUT.PUT_LINE ( v_error_text );
+        INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_dsc)
+                    values (g_ctrl_id, systimestamp, v_error_text);
+        COMMIT;
+        RETURN;
+
+END TRFRECON_VARWGT;
+
+
+PROCEDURE INVRECON_RSVD ( p_ctrl_id IN aut_crr_ctrl.ctrl_id%TYPE )
+IS
+
+  proc_abort    EXCEPTION;
+  v_proc_name    CHAR(15) := 'INVRECON_RSVD';
+  v_error_text   VARCHAR(256);
+  v_trans_source invtrhee.trans_source%TYPE := 'RESFIX';
+  v_proc_source  invtrnee.proc_source%TYPE  := 'UNVFIX';
+  v_trans_feed     invtrhee.trans_feed%TYPE := -5;
+  v_trans_feed_old invtrhee.trans_feed%TYPE := -10;
+  v_session      invtrnee.trans_session%TYPE;
+  v_sequence     invtrnee.trans_sequence%TYPE := 0;
+  v_lmt          INT;
+  v_cnt          INT;
+  v_inners       invtrnee.trans_inners%TYPE;
+  v_weight       invtrnee.trans_weight%TYPE;
+  v_eaches       invtrnee.trans_eaches%TYPE;
+  v_qty          invtrnee.trans_qty%TYPE;
+  v_cost         invtrnee.trans_cost%TYPE;
+  v_retl         invtrnee.trans_retl%TYPE;
+
+  CURSOR C1 IS
+    SELECT CC.org_lvl_child
+          ,org.org_lvl_number
+          ,CC.inner_pk_tech_key
+          ,pcd.inner_pack_id
+          ,pcd.inv_units_per_inner
+          ,prd.prd_lvl_child
+          ,prd.prd_lvl_number
+          ,prd.var_weight_item
+          ,CC.on_hand_inners
+          ,CC.pdd_inners
+          ,CC.on_hand_cost
+          ,CC.on_hand_retl
+          ,CC.on_hand_weight
+    FROM
+    (
+    --SQL ? Get PMM Reserved inventory for DC?s where BOH value  <> 0
+    SELECT NVL(AA.org_lvl_child,BB.trf_ship_loc)          org_lvl_child
+          ,NVL(AA.inner_pk_tech_key,BB.inner_pk_tech_key) inner_pk_tech_key
+          ,AA.ON_HAND_INNERS
+          ,BB.pdd_inners
+          ,AA.On_Hand_Cost
+          ,AA.On_Hand_Retl
+          ,AA.On_Hand_Weight
+    FROM
+    (
+    select pbl.org_lvl_child
+          ,pbl.inner_pk_tech_key
+          ,pbl.on_hand_inners
+          ,pbl.on_hand_cost
+          ,pbl.on_hand_retl
+          ,pbl.on_hand_weight
+    FROM invpblee pbl
+        ,orgmstee org
+    WHERE pbl.inv_type_code = '02'
+    AND   pbl.on_hand_inners <> 0
+    AND   org.org_lvl_child = pbl.org_lvl_child
+    AND   org.org_is_store  = 'F'
+    ) AA
+
+    FULL JOIN
+    --SQL ? Get Post Distribution Request Quantities where PDR status <> 2 and trf_inners <> 0
+    (select pdh.trf_ship_loc
+           ,pdd.inner_pk_tech_key
+           ,SUM(pdd.trf_inners) pdd_inners
+    FROM 	trfpdhee pdh
+         ,trfpddee pdd
+    where pdh.trf_pdh_stat <> 2
+    and   pdd.trf_inners <> 0
+    and   pdd.trf_pdh_key   = pdh.trf_pdh_key
+    group by pdh.trf_ship_loc
+            ,pdd.inner_pk_tech_key
+    ) BB
+
+    ON  BB.trf_ship_loc      = AA.org_lvl_child
+    and BB.inner_pk_tech_key = AA.inner_pk_tech_key
+
+    where on_hand_inners is null
+       or pdd_inners is null
+       or on_hand_inners <> pdd_inners
+    ) CC
+    ,prdpcdee pcd
+    ,prdmstee prd
+    ,orgmstee org
+    WHERE pcd.inner_pk_tech_key = CC.inner_pk_tech_key
+    AND   prd.prd_lvl_child     = pcd.prd_lvl_child
+    AND   org.org_lvl_child     = CC.org_lvl_child
+    ;
+
+
+BEGIN
+  v_error_text := 'SUCCESSFUL';
+
+  BEGIN
+
+    SELECT CTL.ctrl_id
+          ,CTL.ctrl_dsc
+          ,PRM.ctrl_parm_cnt
+    INTO g_ctrl_id, g_ctrl_dsc, v_lmt
+    FROM aut_crr_ctrl CTL
+        ,aut_crr_ctrl_parm PRM
+    WHERE CTL.ctrl_id = p_ctrl_id
+    AND   PRM.ctrl_id = CTL.ctrl_id
+    AND   PRM.ctrl_parm_ct = 'ROWS';
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_error_text := 'EMAIL: No rows found on aut_crr_ctrl and/or aut_crr_ctrl_parm table for ctrl_id = ' || p_ctrl_id
+                      || ' and ctrl_parm_ct = ' || 'ROWS';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (p_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END;
+
+  -- ============================================
+  -- Check for data to process or limit exceeded
+  -- ============================================
+  SELECT count(*)
+  INTO v_cnt
+  FROM
+  (
+  --SQL ? Get PMM Reserved inventory for DC?s where BOH value  <> 0
+  select pbl.org_lvl_child
+        ,pbl.inner_pk_tech_key
+        ,pbl.on_hand_inners
+  FROM invpblee pbl
+      ,orgmstee org
+  WHERE pbl.inv_type_code = '02'
+  AND   pbl.on_hand_inners <> 0
+  AND   org.org_lvl_child = pbl.org_lvl_child
+  AND   org.org_is_store  = 'F'
+  ) AA
+
+  FULL JOIN
+  --SQL ? Get Post Distribution Request Quantities where PDR status <> 2 and trf_inners <> 0
+  (select pdh.trf_ship_loc
+         ,pdd.inner_pk_tech_key
+         ,SUM(pdd.trf_inners) pdd_inners
+  FROM   trfpdhee pdh
+       ,trfpddee pdd
+  where pdh.trf_pdh_stat <> 2
+  and   pdd.trf_inners <> 0
+  and   pdd.trf_pdh_key   = pdh.trf_pdh_key
+  group by pdh.trf_ship_loc
+          ,pdd.inner_pk_tech_key
+  ) BB
+
+  ON  BB.trf_ship_loc      = AA.org_lvl_child
+  and BB.inner_pk_tech_key = AA.inner_pk_tech_key
+
+  where on_hand_inners is null
+     or pdd_inners is null
+     or on_hand_inners <> pdd_inners;
+
+  -- If nothing to process, abort.
+  IF v_cnt = 0 THEN
+      v_error_text := TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) ||
+                  ', ' || g_ctrl_dsc || ' - nothing to process. exit.';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      RAISE proc_abort ;
+  END IF;
+
+  -- If row limit exceeded, email, log, and abort.
+  IF v_cnt > v_lmt THEN
+      v_error_text := 'EMAIL: '  || trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', ROW limit exceeded - nothing processed. Count = ' || to_char(v_cnt) ||
+                  ', Limit = ' || to_char(v_lmt);
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+      RAISE proc_abort ;
+  END IF;
+
+
+  -- Before inserting invtrhee rows with v_trans_feed, update
+  -- any leftover uncompleted inventory sessions to v_trans_feed_old
+  UPDATE invtrhee SET trans_feed = v_trans_feed_old
+  WHERE trans_feed = v_trans_feed;
+  COMMIT;
+
+  bastkey('trans_session', 0, v_session);
+
+  INSERT INTO invtrhee
+         (trans_session, trans_user, trans_batch_date, trans_source, trans_audited, trans_feed)
+  VALUES (v_session, substr(USER,1,10), SYSDATE, v_trans_source, 'T', v_trans_feed) ;
+
+  FOR C1_Rec IN C1
+  LOOP
+
+      v_inners := nvl(C1_Rec.on_hand_inners,0) - nvl(C1_Rec.pdd_inners,0);
+      v_weight := nvl(C1_Rec.on_hand_weight,0);
+      IF C1_Rec.var_weight_item = 'F'
+      THEN
+         v_weight := 0;
+         v_eaches := null;
+         v_qty    := v_inners * C1_Rec.inv_units_per_inner;
+      else
+         v_eaches := nvl(C1_Rec.on_hand_weight,0);
+         v_qty    := nvl(C1_Rec.on_hand_weight,0);
+      end if;
+
+      if v_qty = 0
+        then v_eaches := v_inners * C1_Rec.inv_units_per_inner;
+             v_qty    := v_inners * C1_Rec.inv_units_per_inner;
+      end if;
+
+      if nvl(C1_Rec.on_hand_cost,0) = 0
+        then v_cost := 0;
+      else
+        v_cost := abs(C1_Rec.on_hand_cost/v_qty);
+      end if;
+
+      if nvl(C1_Rec.on_hand_retl,0) = 0
+        then v_retl := 0;
+      else
+        v_retl := (C1_Rec.on_hand_retl/v_qty);
+      end if;
+
+      v_sequence := v_sequence + 1 ;
+
+-- insert a row to move inventory from Reserved - MV-03
+
+      INSERT INTO invtrnee
+           (
+           trans_session,           trans_sequence,
+           trans_org_child,         trans_prd_child,
+           trans_date,              proc_source,
+           trans_qty,               trans_retl,
+           trans_cost,              trans_ext_retl,
+           trans_ext_cost,          inv_mrpt_code,
+           inv_drpt_code,           trans_curr_code,
+           trans_trn_code,          trans_type_code,
+           trans_pos_ext_total,     trans_uom,
+           trans_weight,            trans_weight_uom,
+           inner_pack_id,           inner_pk_tech_key,
+           trans_inners,            var_weight_item,
+           trans_org_lvl_number,    trans_prd_lvl_number,
+           trans_eaches
+           )
+           VALUES
+           (
+           v_session,               v_sequence,
+           C1_Rec.org_lvl_child,    C1_Rec.prd_lvl_child,
+           TRUNC(sysdate),          v_proc_source,
+           v_qty,                   v_retl,
+           v_cost,                  C1_Rec.on_hand_retl,
+           C1_Rec.on_hand_cost,     'MV',
+          '03',                     'USD',
+          '63',                     '02',
+          C1_Rec.on_hand_retl,      'EA',
+          v_weight,                 'LB',
+          C1_Rec.inner_pack_id,     C1_Rec.inner_pk_tech_key,
+          v_inners,                 C1_Rec.var_weight_item,
+          C1_Rec.org_lvl_number,    C1_Rec.prd_lvl_number,
+          v_eaches);
+
+      v_sequence := v_sequence + 1 ;
+
+-- insert a row to move the inventory into saleable - MV-02
+
+      INSERT INTO invtrnee
+           (
+           trans_session,           trans_sequence,
+           trans_org_child,         trans_prd_child,
+           trans_date,              proc_source,
+           trans_qty,               trans_retl,
+           trans_cost,              trans_ext_retl,
+           trans_ext_cost,          inv_mrpt_code,
+           inv_drpt_code,           trans_curr_code,
+           trans_trn_code,          trans_type_code,
+           trans_pos_ext_total,     trans_uom,
+           trans_weight,            trans_weight_uom,
+           inner_pack_id,           inner_pk_tech_key,
+           trans_inners,            var_weight_item,
+           trans_org_lvl_number,    trans_prd_lvl_number,
+           trans_eaches
+           )
+           VALUES
+           (
+           v_session,               v_sequence,
+           C1_Rec.org_lvl_child,    C1_Rec.prd_lvl_child,
+           TRUNC(sysdate),          v_proc_source,
+           v_qty,                   v_retl,
+           v_cost,                  C1_Rec.on_hand_retl,
+           C1_Rec.on_hand_cost,     'MV',
+          '02',                     'USD',
+          '64',                     '01',
+          C1_Rec.on_hand_retl,      'EA',
+          v_weight,                 'LB',
+          C1_Rec.inner_pack_id,     C1_Rec.inner_pk_tech_key,
+          v_inners,                 C1_Rec.var_weight_item,
+          C1_Rec.org_lvl_number,    C1_Rec.prd_lvl_number,
+          v_eaches);
+
+  END LOOP;
+
+  COMMIT;
+
+  -----------------------
+  -- Process inventory
+  -----------------------
+
+  SELECT count(*)
+  INTO v_cnt
+  FROM invtrnee
+  WHERE trans_session = v_session;
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute invtrnprc, trans_session = ' || to_char(v_session) );
+
+  v_proc_name := 'INVTRNPRC';
+  invtrnprc (v_session);
+  v_proc_name := 'INVRECON_RSVD';
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute invtrnprc complete' );
+
+  INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+              values (g_ctrl_id, systimestamp, v_cnt
+                     ,'invtrnprc executed, trans_session = ' || to_char(v_session) );
+
+
+  INVIMP_NOTIFY_REJ (v_proc_name, v_session);
+
+
+EXCEPTION
+
+    WHEN proc_abort THEN
+      COMMIT;
+      RETURN;
+
+    WHEN OTHERS THEN
+        v_error_text := 'EMAIL: Proc failed: ' || trim(v_proc_name) || ': ' || SUBSTR(SQLERRM, 1, 210);
+        DBMS_OUTPUT.PUT_LINE ( v_error_text );
+        INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_dsc)
+                    values (g_ctrl_id, systimestamp, v_error_text);
+        COMMIT;
+        RETURN;
+
+END INVRECON_RSVD;
+
+
+PROCEDURE INVUNAVAIL_WGT ( p_ctrl_id IN aut_crr_ctrl.ctrl_id%TYPE )
+IS
+
+  proc_abort    EXCEPTION;
+  v_proc_name    CHAR(15) := 'INVUNAVAIL_WGT';
+  v_error_text   VARCHAR(256);
+  v_trans_source invtrhee.trans_source%TYPE := 'UNVFIX';
+  v_trans_feed     invtrhee.trans_feed%TYPE := -5;
+  v_trans_feed_old invtrhee.trans_feed%TYPE := -10;
+  v_session      invtrnee.trans_session%TYPE;
+  v_sequence     invtrnee.trans_sequence%TYPE := 0;
+  v_lmt          INT;
+  v_cnt          INT;
+  v_weight       invtrnee.trans_weight%TYPE;
+  v_eaches       invtrnee.trans_eaches%TYPE;
+  v_qty          invtrnee.trans_qty%TYPE;
+  v_cost         invtrnee.trans_cost%TYPE;
+  v_retl         invtrnee.trans_retl%TYPE;
+  v_zero_wgt_cnt number;
+
+  CURSOR C1 IS
+    SELECT prd.prd_lvl_number
+          ,prd.var_weight_item
+          ,prd.prd_lvl_child
+          ,org.org_lvl_number
+          ,org.org_lvl_child
+          ,pcd.inner_pack_id
+          ,pcd.inv_units_per_inner
+          ,pbl.on_hand_inners
+          ,pbl.on_hand_cost
+          ,pbl.on_hand_retl
+          ,pbl.on_hand_weight
+          ,pbl.inner_pk_tech_key
+    FROM orgmstee org
+        ,invpblee pbl
+        ,prdmstee prd
+        ,prdpcdee pcd
+    WHERE pbl.inv_type_code     = '03'
+    AND   pbl.on_hand_inners    <> 0
+    AND   pbl.last_chg_date     < SYSDATE - 1
+    AND   org.org_is_store      = 'F'
+    AND   prd.var_weight_item   = 'T'
+    AND   prd.prd_lvl_child     = pbl.prd_lvl_child
+    AND   pbl.org_lvl_child     = org.org_lvl_child
+    AND   pbl.inner_pk_tech_key = pcd.inner_pk_tech_key;
+
+BEGIN
+  v_error_text := 'SUCCESSFUL';
+
+  BEGIN
+
+    SELECT CTL.ctrl_id
+          ,CTL.ctrl_dsc
+          ,PRM.ctrl_parm_cnt
+    INTO g_ctrl_id, g_ctrl_dsc, v_lmt
+    FROM aut_crr_ctrl CTL
+        ,aut_crr_ctrl_parm PRM
+    WHERE CTL.ctrl_id = p_ctrl_id
+    AND   PRM.ctrl_id = CTL.ctrl_id
+    AND   PRM.ctrl_parm_ct = 'ROWS';
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_error_text := 'EMAIL: No rows found on aut_crr_ctrl and/or aut_crr_ctrl_parm table for ctrl_id = ' || p_ctrl_id
+                      || ' and ctrl_parm_ct = ' || 'ROWS';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (p_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END;
+
+  -- ============================================
+  -- Check for data to process or limit exceeded
+  -- ============================================
+  SELECT count(*)
+  INTO v_cnt
+  FROM orgmstee org
+      ,invpblee pbl
+      ,prdmstee prd
+  WHERE pbl.inv_type_code     = '03'
+  AND   pbl.on_hand_inners    <> 0
+  AND   pbl.last_chg_date     < SYSDATE - 1
+  AND   org.org_is_store      = 'F'
+  AND   prd.var_weight_item   = 'T'
+  AND   prd.prd_lvl_child     = pbl.prd_lvl_child
+  AND   pbl.org_lvl_child     = org.org_lvl_child;
+
+  -- If nothing to process, abort.
+  IF v_cnt = 0 THEN
+      v_error_text := TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) ||
+                  ', ' || g_ctrl_dsc || ' - nothing to process. exit.';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      RAISE proc_abort ;
+  END IF;
+
+  -- If row limit exceeded, email, log, and abort.
+  IF v_cnt > v_lmt THEN
+      v_error_text := 'EMAIL: '  || trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', ROW limit exceeded - nothing processed. Count = ' || to_char(v_cnt) ||
+                  ', Limit = ' || to_char(v_lmt);
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+      RAISE proc_abort ;
+  END IF;
+
+
+  -- Before inserting invtrhee rows with v_trans_feed, update
+  -- any leftover uncompleted inventory sessions to v_trans_feed_old
+  UPDATE invtrhee SET trans_feed = v_trans_feed_old
+  WHERE trans_feed = v_trans_feed;
+  COMMIT;
+
+  bastkey('trans_session', 0, v_session);
+
+  INSERT INTO invtrhee
+         (trans_session, trans_user, trans_batch_date, trans_source, trans_audited, trans_feed)
+  VALUES (v_session, substr(USER,1,10), SYSDATE, v_trans_source, 'T', v_trans_feed) ;
+
+  FOR C1_Rec IN C1
+  LOOP
+
+      v_zero_wgt_cnt := 0;
+      v_weight := nvl(C1_Rec.on_hand_weight,0);
+
+      IF v_weight = 0 THEN
+         v_weight := C1_Rec.on_hand_inners * C1_Rec.inv_units_per_inner;
+         v_zero_wgt_cnt := 1;
+      END IF;
+
+      v_eaches := v_weight;
+      v_qty := v_weight ;
+
+      IF nvl(C1_Rec.on_hand_cost,0) = 0
+         THEN v_cost := 0;
+      ELSE
+         v_cost := abs(C1_Rec.on_hand_cost/v_qty);
+      END IF;
+
+      IF nvl(C1_Rec.on_hand_retl,0) = 0
+         THEN v_retl := 0;
+      ELSE
+         v_retl := (C1_Rec.on_hand_retl/v_qty);
+      END IF;
+
+-- insert a row to move inventory from Allocated - MV-05
+      v_sequence := v_sequence + 1 ;
+      INSERT INTO invtrnee
+           (
+           trans_session,           trans_sequence,
+           trans_org_child,         trans_prd_child,
+           trans_date,              proc_source,
+           trans_qty,               trans_retl,
+           trans_cost,              trans_ext_retl,
+           trans_ext_cost,          inv_mrpt_code,
+           inv_drpt_code,           trans_curr_code,
+           trans_trn_code,          trans_type_code,
+           trans_pos_ext_total,     trans_uom,
+           trans_weight,            trans_weight_uom,
+           inner_pack_id,           inner_pk_tech_key,
+           trans_inners,            var_weight_item,
+           trans_org_lvl_number,    trans_prd_lvl_number,
+           trans_eaches
+           )
+      VALUES
+           (
+           v_session,               v_sequence,
+           C1_Rec.org_lvl_child,    C1_Rec.prd_lvl_child,
+           TRUNC(sysdate),          'UNVFIX',
+           v_qty,                   v_retl,
+           v_cost,                  C1_Rec.on_hand_retl,
+           C1_Rec.on_hand_cost,     'MV',
+           '05',                    'USD',
+           '63',                    '03',
+           C1_Rec.on_hand_retl,     'EA',
+           v_weight,                'LB',
+           C1_Rec.inner_pack_id,    C1_Rec.inner_pk_tech_key,
+           C1_Rec.on_hand_inners,   C1_Rec.var_weight_item,
+           C1_Rec.org_lvl_number,   C1_Rec.prd_lvl_number,
+           v_eaches);
+
+-- insert a row to move the inventory into saleable - MV-02
+-- if the weight on the unavailable inventory row is zero - create and MV06 transaction to add weight
+      IF v_zero_wgt_cnt = 1 THEN
+
+        v_sequence := v_sequence + 1 ;
+        INSERT INTO invtrnee
+             (
+             trans_session,           trans_sequence,
+             trans_org_child,         trans_prd_child,
+             trans_date,              proc_source,
+             trans_qty,               trans_retl,
+             trans_cost,              trans_ext_retl,
+             trans_ext_cost,          inv_mrpt_code,
+             inv_drpt_code,           trans_curr_code,
+             trans_trn_code,          trans_type_code,
+             trans_pos_ext_total,     trans_uom,
+             trans_weight,            trans_weight_uom,
+             inner_pack_id,           inner_pk_tech_key,
+             trans_inners,            var_weight_item,
+             trans_org_lvl_number,    trans_prd_lvl_number,
+             trans_eaches
+             )
+        VALUES
+             (
+             v_session,               v_sequence,
+             C1_Rec.org_lvl_child,    C1_Rec.prd_lvl_child,
+             TRUNC(sysdate),          'WGTFIX',
+             0,                       0,
+             0,                       0,
+             0,                       'MV',
+             '06',                    'USD',
+             '64',                    '03',
+             0,                       'EA',
+             v_weight,                'LB',
+             C1_Rec.inner_pack_id,    C1_Rec.inner_pk_tech_key,
+             0,                       C1_Rec.var_weight_item,
+             C1_Rec.org_lvl_number,   C1_Rec.prd_lvl_number,
+             v_eaches);
+
+      END IF;
+
+-- insert a row to move the inventory into saleable - MV-02
+      v_sequence := v_sequence + 1 ;
+      INSERT INTO invtrnee
+           (
+           trans_session,           trans_sequence,
+           trans_org_child,         trans_prd_child,
+           trans_date,              proc_source,
+           trans_qty,               trans_retl,
+           trans_cost,              trans_ext_retl,
+           trans_ext_cost,          inv_mrpt_code,
+           inv_drpt_code,           trans_curr_code,
+           trans_trn_code,          trans_type_code,
+           trans_pos_ext_total,     trans_uom,
+           trans_weight,            trans_weight_uom,
+           inner_pack_id,           inner_pk_tech_key,
+           trans_inners,            var_weight_item,
+           trans_org_lvl_number,    trans_prd_lvl_number,
+           trans_eaches
+           )
+      VALUES
+           (
+           v_session,               v_sequence,
+           C1_Rec.org_lvl_child,    C1_Rec.prd_lvl_child,
+           TRUNC(sysdate),          'UNVFIX',
+           v_qty,                   v_retl,
+           v_cost,                  C1_Rec.on_hand_retl,
+           C1_Rec.on_hand_cost,     'MV',
+           '02',                    'USD',
+           '64',                    '01',
+           C1_Rec.on_hand_retl,     'EA',
+           v_weight,                'LB',
+           C1_Rec.inner_pack_id,    C1_Rec.inner_pk_tech_key,
+           C1_Rec.on_hand_inners,   C1_Rec.var_weight_item,
+           C1_Rec.org_lvl_number,   C1_Rec.prd_lvl_number,
+           v_eaches);
+
+  END LOOP;
+
+  COMMIT;
+
+  -----------------------
+  -- Process inventory
+  -----------------------
+
+  SELECT count(*)
+  INTO v_cnt
+  FROM invtrnee
+  WHERE trans_session = v_session;
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute invtrnprc, trans_session = ' || to_char(v_session) );
+
+  v_proc_name := 'INVTRNPRC';
+  invtrnprc (v_session);
+  v_proc_name := 'INVUNAVAIL_WGT';
+
+  dbms_output.put_line ( TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) || ', ' ||
+                        g_ctrl_dsc || ', Execute invtrnprc complete' );
+
+  INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+              values (g_ctrl_id, systimestamp, v_cnt
+                     ,'invtrnprc executed, trans_session = ' || to_char(v_session) );
+
+
+  INVIMP_NOTIFY_REJ (v_proc_name, v_session);
+
+
+EXCEPTION
+
+    WHEN proc_abort THEN
+      COMMIT;
+      RETURN;
+
+    WHEN OTHERS THEN
+        v_error_text := 'EMAIL: Proc failed: ' || trim(v_proc_name) || ': ' || SUBSTR(SQLERRM, 1, 210);
+        DBMS_OUTPUT.PUT_LINE ( v_error_text );
+        INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_dsc)
+                    values (g_ctrl_id, systimestamp, v_error_text);
+        COMMIT;
+        RETURN;
+
+END INVUNAVAIL_WGT;
+
+PROCEDURE PMGSTR_REJ175 ( p_ctrl_id IN aut_crr_ctrl.ctrl_id%TYPE )
+IS
+
+  proc_abort     EXCEPTION;
+  v_proc_name     CHAR(15) := 'PMGSTR_REJ';
+  v_error_text    VARCHAR(256);
+  v_po_exists     BOOLEAN;
+  v_lmt           INT;
+  v_cnt           INT;
+  v_pmg_po_number pmghdree.pmg_po_number%TYPE;
+  v_pmg_stat_code pmghdree.pmg_stat_code%TYPE;
+  v_pmg_cnt       INT;
+
+  CURSOR C1 IS
+    SELECT hd.pmg_po_number
+          ,hd.tran_type
+          ,COUNT(*) cnt1
+    FROM sdihdirej hd
+        ,sdidtirej dt
+    WHERE hd.error_code = 175
+    AND   hd.tran_type = dt.tran_type
+    and   hd.pmg_po_number = dt.pmg_po_number
+    GROUP BY hd.pmg_po_number, hd.tran_type;
+
+BEGIN
+
+  BEGIN
+
+    SELECT CTL.ctrl_id
+          ,CTL.ctrl_dsc
+          ,PRM.ctrl_parm_cnt
+    INTO g_ctrl_id, g_ctrl_dsc, v_lmt
+    FROM aut_crr_ctrl CTL
+        ,aut_crr_ctrl_parm PRM
+    WHERE CTL.ctrl_id = p_ctrl_id
+    AND   PRM.ctrl_id = CTL.ctrl_id
+    AND   PRM.ctrl_parm_ct = 'PO LIMIT';
+
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_error_text := 'EMAIL: No rows found on aut_crr_ctrl and/or aut_crr_ctrl_parm table for ctrl_id = ' || p_ctrl_id
+                      || ' and ctrl_parm_ct = ' || 'PO LIMIT';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (p_ctrl_id, systimestamp, null, v_error_text);
+      RAISE proc_abort ;
+
+  END;
+
+  -- ============================================
+  -- Check for data to process or limit exceeded
+  -- ============================================
+  SELECT COUNT(DISTINCT hd.pmg_po_number)
+  INTO v_cnt
+  FROM sdihdirej hd
+      ,sdidtirej dt
+  WHERE hd.error_code    = 175
+  AND   hd.tran_type     = dt.tran_type
+  AND   hd.pmg_po_number = dt.pmg_po_number ;
+
+  -- If nothing to process, abort.
+  IF v_cnt = 0 THEN
+      v_error_text := TO_CHAR(SYSDATE, 'MM-DD-YYYY HH24:MI:SS') || ' ' || trim(v_proc_name) ||
+                  ', ' || g_ctrl_dsc || ' - nothing to process. exit.';
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      RAISE proc_abort ;
+  END IF;
+
+  -- If PO limit exceeded, email, log, and abort.
+  IF v_cnt > v_lmt THEN
+      v_error_text := 'EMAIL: '  || trim(v_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', PO limit exceeded - nothing processed. Count = ' || to_char(v_cnt) ||
+                  ', Limit = ' || to_char(v_lmt);
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+      RAISE proc_abort ;
+  END IF;
+
+
+  FOR C1_Rec IN C1
+  LOOP
+
+    BEGIN
+      v_po_exists := TRUE;
+      SELECT hdr.pmg_po_number
+            ,hdr.pmg_stat_code
+            ,COUNT(*)
+      INTO v_pmg_po_number
+          ,v_pmg_stat_code
+          ,v_pmg_cnt
+      FROM pmghdree hdr
+          ,pmgdtlee dtl
+      WHERE hdr.pmg_po_number = C1_Rec.pmg_po_number
+      AND   dtl.pmg_po_number = hdr.pmg_po_number
+      GROUP BY hdr.pmg_po_number, hdr.pmg_stat_code;
+
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+      v_po_exists := FALSE;
+    END;
+
+    v_error_text := trim(v_proc_name) || ', ' || g_ctrl_dsc ||', PO# ' || to_char(C1_Rec.Pmg_Po_Number);
+
+    IF v_po_exists THEN
+
+       DELETE FROM sdidtirej
+       WHERE pmg_po_number = C1_Rec.pmg_po_number
+       AND   tran_type     = C1_Rec.Tran_Type;
+
+       v_cnt := SQL%ROWCOUNT;
+
+       DELETE FROM sdihdirej
+       WHERE pmg_po_number = C1_Rec.pmg_po_number
+       AND   tran_type     = C1_Rec.Tran_Type;
+
+       IF v_pmg_stat_code = 0 THEN
+         v_error_text := v_error_text || ', PO STATUS IS 0';
+       END IF;
+
+       IF C1_Rec.Cnt1 <> v_pmg_cnt THEN
+         v_error_text := v_error_text || ', COUNT OF SDIDTIREJ vs PMG DETAIL ROWS DOES NOT MATCH, SDI = ' ||
+                         to_char(C1_Rec.cnt1) || ' PMG = ' || to_char(v_pmg_cnt);
+       END IF;
+
+       v_error_text := v_error_text || ', sdidtirej rows deleted = ' || to_char(v_cnt);
+
+    ELSE
+       v_cnt := 0;
+       v_error_text := 'EMAIL: ' || v_error_text ||
+           ', sdi(hdi/dti)rej rows not found on pmg(hdr/dtl)ee tables. SDI rows not deleted. Please investigate.';
+    END IF;
+
+    DBMS_OUTPUT.PUT_LINE ( v_error_text );
+    INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+           VALUES (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+
+  END LOOP;
+
+  COMMIT;
+
+EXCEPTION
+
+    WHEN proc_abort THEN
+      COMMIT;
+      RETURN;
+
+    WHEN OTHERS THEN
+        v_error_text := 'EMAIL: Proc failed: ' || trim(v_proc_name) || ': ' || SUBSTR(SQLERRM, 1, 210);
+        DBMS_OUTPUT.PUT_LINE ( v_error_text );
+        INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_dsc)
+                    values (g_ctrl_id, systimestamp, v_error_text);
+        COMMIT;
+        RETURN;
+
+END PMGSTR_REJ175;
+
+
+PROCEDURE TRFIMP_NOTIFY_REJ (
+    p_proc_name IN CHAR,
+    p_session   IN sditrfdti.session_number%TYPE )
+IS
+  v_cnt         INT;
+  v_error_text  VARCHAR(256);
+
+BEGIN
+-- If rejects on sditrfdti after execution of trfdtlim, notify and log
+  SELECT COUNT(*) INTO v_cnt
+  FROM sditrfdti
+  WHERE session_number = p_session
+  AND   tech_key > 6000;
+
+  IF v_cnt > 0 THEN
+      v_error_text := 'EMAIL: '  || trim(p_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', sditrfdti rejected row count = ' || to_char(v_cnt) ||
+                  ', session_number = ' || to_char(p_session);
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+  END IF;
+
+END TRFIMP_NOTIFY_REJ;
+
+
+PROCEDURE INVIMP_NOTIFY_REJ (
+    p_proc_name IN CHAR,
+    p_session   IN invrejee.trans_session%TYPE  )
+IS
+  v_cnt         INT;
+  v_error_text  VARCHAR(256);
+
+BEGIN
+  SELECT COUNT(*) INTO v_cnt
+  FROM invrejee
+  WHERE trans_session = p_session;
+
+  IF v_cnt > 0 THEN
+      v_error_text := trim(p_proc_name) || ', ' || g_ctrl_dsc ||
+                  ', invrejee rejected row count = ' || to_char(v_cnt) ||
+                  ', trans_session = ' || to_char(p_session);
+
+      DBMS_OUTPUT.PUT_LINE ( v_error_text );
+
+      INSERT INTO aut_crr_ctrl_log (ctrl_id, rw_crt_ts, log_cnt, log_dsc)
+                  values (g_ctrl_id, systimestamp, v_cnt, v_error_text);
+  END IF;
+
+END INVIMP_NOTIFY_REJ;
+
+END AUTO_CORRECT_PKG;

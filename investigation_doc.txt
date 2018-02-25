@@ -1,0 +1,228 @@
+create or replace TRIGGER TRG_AUDIT_STORE
+BEFORE DELETE OR UPDATE ON STORE
+FOR EACH ROW
+DECLARE
+
+--Changed on 19-Sep-2015
+
+    V_SYSDATE DATE;
+    V_UPDATED_BY NUMBER;
+    V_USER_NAME VARCHAR2(50);
+    V_STORE_COUNT NUMBER;
+    V_COUNT  NUMBER;
+
+    V_MAX_RANK           NUMBER;
+    V_CUR_RANK           NUMBER;
+
+    NODE_COUNT           NUMBER;
+    V_RANK               NUMBER;
+    v_dummy_rank         NUMBER := 0;
+    V_COUNT_STATUS       NUMBER;
+    v_gap                NUMBER;
+    v_err_count          NUMBER;
+    V_TOTAL_RECORD_COUNT NUMBER;
+
+    V_BASE_ITEM_ID     VARCHAR2(100);
+    v_node_item_id     VARCHAR2(100);
+
+    v_store_id VARCHAR2(50);
+
+BEGIN
+
+
+SELECT SYSDATE
+INTO V_SYSDATE
+FROM DUAL;
+
+--V_UPDATED_BY := :OLD.UPDATED_BY;
+V_UPDATED_BY := :NEW.UPDATED_BY;
+
+
+
+ CASE
+    WHEN UPDATING THEN
+
+IF UPDATING('STORE_NAME') THEN
+    IF (:OLD.STORE_NAME <> :NEW.STORE_NAME) THEN
+INSERT INTO AUDIT_DETAILS
+(
+ ID,
+RECORD_KEY,
+ENTITY_NAME,
+ATTRIBUTE_NAME,
+TRANSACTION_TYPE,
+OLD_VALUE,
+NEW_VALUE,
+CHANGED_BY,
+CHANGED_ON)
+    VALUES
+    (
+    SEQ_AUDIT_DETAILS.NEXTVAL,
+    :OLD.STORE_ID,
+    'STORE',
+    'STORE_NAME',
+    'U',
+    :OLD.STORE_NAME,
+    :NEW.STORE_NAME,
+    NVL(:NEW.UPDATED_BY,1),
+    V_SYSDATE
+    );
+    END IF;
+END IF;
+
+ WHEN DELETING THEN
+
+ --v_store_id : =
+
+ FOR I1 IN (SELECT DISTINCT ITEM_ID FROM ITEM_STORE_TRAIT WHERE STORE_ID = :OLD.STORE_ID) LOOP
+
+ SELECT COUNT(STORE_ID)
+ INTO V_STORE_COUNT
+ FROM ITEM_STORE_TRAIT
+ WHERE ITEM_ID = I1.ITEM_ID;
+
+ -----ITEM IS TAGGED TO OTHER STORES OTHER THAN THE STORE THAT IS TO BE DELETED--------
+ IF (V_STORE_COUNT > 1 ) THEN
+ DBMS_OUTPUT.PUT_LINE('ITEM IS TAGGED TO OTHER STORES OTHER THAN THE STORE THAT IS TO BE DELETED');
+      -----CHECK IF THE ITEM IS PRESENT AS A BASE ITEM-----
+ SELECT COUNT(1)
+ INTO V_COUNT
+ FROM SUBSTITUTION_ELEMENT
+ WHERE BASE_ITEM_ID = I1.ITEM_ID;
+ -----IF TRUE THEN ---------
+         IF (V_COUNT >0 ) THEN
+
+         DELETE FROM  SPECIFIC_SUBS_TREE WHERE BASE_ITEM_ID = I1.ITEM_ID  AND STORE_ID = :OLD.STORE_ID;
+
+         END IF;
+
+         ----- CHECK IF ITEM IS A NODE ITEM-----  Commented on 04-SEP-2015---
+        /*
+         SELECT COUNT(1)
+         INTO V_COUNT
+         FROM SUBSTITUTION_ELEMENT
+         WHERE NODE_ITEM_ID = I1.ITEM_ID;
+         -----IF TRUE THEN ------
+              IF (V_COUNT > 0) THEN
+
+              FOR  J IN (SELECT DISTINCT BASE_ITEM_ID FROM substitution_element WHERE NODE_ITEM_ID = I1.ITEM_ID) LOOP
+
+              DELETE FROM SUBSTITUTION_ELEMENT WHERE BASE_ITEM_ID = J.BASE_ITEM_ID AND NODE_ITEM_ID = I1.ITEM_ID;
+
+              UPDATE SUBS_TREE
+              SET UPDATED_ON = V_SYSDATE,
+                  UPDATED_BY = 1--V_UPDATED_BY
+              WHERE BASE_ITEM_ID = J.BASE_ITEM_ID;
+
+             END LOOP;
+
+              END IF;
+           */
+        -- END IF;
+
+ --------------ITEM IS TAGGED TO ONLY THE STORE THAT IS TO BE DELETED--------
+ ELSIF (V_STORE_COUNT = 1) THEN
+ DBMS_OUTPUT.PUT_LINE('ITEM IS TAGGED TO ONLY THE STORE THAT IS TO BE DELETED');
+ -----MARK THE ITEM AS DELETED IN ITEM METADATA----------------
+ UPDATE ITEM_METADATA
+ SET IS_DELETED = 'Y',
+     UPDATED_BY = 1,--V_UPDATED_BY,
+     UPDATED_ON = V_SYSDATE
+ WHERE ITEM_ID = I1.ITEM_ID;
+ -----CHECK IF THE ITEM IS PRESENT AS A BASE ITEM-----
+ SELECT COUNT(1)
+ INTO V_COUNT
+ FROM SUBSTITUTION_ELEMENT
+ WHERE BASE_ITEM_ID = I1.ITEM_ID;
+ -----IF TRUE THEN ---------
+ IF (V_COUNT >0 ) THEN
+
+ DELETE FROM SUBSTITUTION_ELEMENT  WHERE BASE_ITEM_ID = I1.ITEM_ID;
+
+ DELETE FROM SPECIFIC_SUBS_TREE WHERE BASE_ITEM_ID = I1.ITEM_ID;
+
+ DELETE FROM SUBS_TREE WHERE BASE_ITEM_ID = I1.ITEM_ID;
+
+ END IF;
+
+ -----CHECK IF ITEM IS A NODE ITEM-----
+
+ SELECT COUNT(1)
+ INTO V_COUNT
+ FROM SUBSTITUTION_ELEMENT
+ WHERE NODE_ITEM_ID = I1.ITEM_ID;
+
+ -----IF TRUE THEN ------
+      IF (V_COUNT > 0) THEN
+
+      FOR  J IN (SELECT DISTINCT BASE_ITEM_ID FROM substitution_element WHERE NODE_ITEM_ID = I1.ITEM_ID) LOOP
+
+      DELETE FROM SUBSTITUTION_ELEMENT WHERE BASE_ITEM_ID = J.BASE_ITEM_ID AND NODE_ITEM_ID = I1.ITEM_ID;
+
+      UPDATE SUBS_TREE
+              SET UPDATED_ON = V_SYSDATE,
+                  UPDATED_BY = 1--V_UPDATED_BY
+              WHERE BASE_ITEM_ID = J.BASE_ITEM_ID;
+
+     END LOOP;
+
+      END IF;
+
+ END IF;
+
+-- DELETE FROM ITEM_STORE_TRAIT WHERE STORE_ID = :OLD.STORE_ID AND ITEM_ID = I1.ITEM_ID;
+
+ END LOOP;
+  DELETE FROM ITEM_STORE_TRAIT WHERE STORE_ID = :OLD.STORE_ID;
+ ---
+
+              -----Re-Ranking of existing Nodes with Gaps due to deletion of nodes or business validation------
+
+         v_dummy_rank := 0;
+
+         FOR I IN (SELECT DISTINCT BASE_ITEM_ID FROM SUBSTITUTION_ELEMENT) LOOP
+
+
+              FOR J IN (SELECT NODE_ITEM_ID,RANK FROM SUBSTITUTION_ELEMENT
+              where base_item_id = i.base_item_id
+              order by rank asc) LOOP
+
+              v_node_item_id := j.node_item_id;
+              v_rank := j.rank;
+
+              v_gap := v_rank - v_dummy_rank;
+
+            DBMS_OUTPUT.PUT_LINE('Node '||v_node_item_id||' Rank '||v_rank||' Gap in Rank '||v_gap);
+                  if (v_gap = 1 ) then
+
+                  v_dummy_rank := v_rank;
+
+                  else
+
+                  UPDATE SUBSTITUTION_ELEMENT
+                  SET RANK = RANK - v_gap + 1,
+                      UPDATED_ON= V_SYSDATE
+                  WHERE NODE_ITEM_ID = J.NODE_ITEM_ID
+                  AND   BASE_ITEM_ID = I.BASE_ITEM_ID;
+
+                  UPDATE SPECIFIC_SUBS_TREE
+                  SET UPDATED_BY = 1,--V_UPDATED_BY,
+                      UPDATED_ON = V_SYSDATE
+                  WHERE  BASE_ITEM_ID = I.BASE_ITEM_ID;
+
+
+                  end if;
+
+              END LOOP;
+
+            v_dummy_rank := 0;
+
+          END LOOP;
+
+
+
+END CASE;
+
+
+
+END;
