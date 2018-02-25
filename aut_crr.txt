@@ -1,0 +1,73 @@
+#!/bin/ksh
+#----------------------------------------------------------------------------------#
+#  Script:       aut_crr_ctrl.ksh
+#  Description:  Execute auto correct procs based on mdi_aut_crr_ctrl table entries
+#
+#  Date       Programmer    Description of Change
+#  ---------- ----------    -------------------------------------------------------
+#  07/20/2015 Bill Oosse    Created script
+#
+#----------------------------------------------------------------------------------#
+
+. /Meijer_sfwe/sdiadm/scripts/auto_correct/aut_crr_ctrl.config
+
+cd $APPDIR
+
+if [ `cat $LOGFILE |wc -l` -gt $LOGSIZE ]
+then
+  tail -$LOGSIZE $LOGFILE > temp.log
+  mv temp.log $LOGFILE
+fi
+
+# change EMAIL in the log file so it doesnt resend previous emails
+if [ `grep "EMAIL" $LOGFILE | wc -l` -ne 0 ]
+then
+  sed s/EMAIL/MAILD/ $LOGFILE > temp.log
+  mv temp.log $LOGFILE
+fi
+
+date +%D" "%r" aut_crr_ctrl.ksh started." | tee -a $LOGFILE
+
+EXITSTATUS=0
+OUTFILE=$APPDIR/ctrl.out
+
+sqlplus -S -L $PMMUSER/$PMMPASSWORD@$PMMSERVER @aut_crr_ctrl.sql > $OUTFILE
+
+if [ `egrep "SQLCODE [^0]|sqlcode [^0]" $OUTFILE | wc -l` -ne 0 ]
+then
+  exit 1
+fi
+
+grep aaa $OUTFILE > $APPDIR/ctrl.in
+
+IFS=,
+
+while read procnm ctrlid junk
+do
+
+  sed "s/PROCNAMEHERE/$procnm/;s/CTRLIDHERE/$ctrlid/" proc_template.sql > "$ctrlid.sql"
+
+  sqlplus -S -L $PMMUSER/$PMMPASSWORD@$PMMSERVER @$ctrlid.sql | tee -a $LOGFILE
+
+  if [ $? -ne 0 ]
+  then
+    date +%D" "%r" Failure trying to execute $ctrlid.sql !!" | tee -a $LOGFILE
+    EXITSTATUS=1
+  fi
+
+done < $APPDIR/ctrl.in
+
+
+if [ `grep "EMAIL" $LOGFILE | wc -l` -ne 0 ]
+then
+  grep "EMAIL" $LOGFILE |cut -b 7-500 |mail -s"Auto Correction Alert" $MAILLIST
+fi
+
+if [ `egrep "SQLCODE [^0]|sqlcode [^0]" $LOGFILE | wc -l` -ne 0 ]
+then
+  EXITSTATUS=1
+fi
+
+date +%D" "%r" aut_crr_ctrl.ksh finished." | tee -a $LOGFILE
+
+exit $EXITSTATUS
